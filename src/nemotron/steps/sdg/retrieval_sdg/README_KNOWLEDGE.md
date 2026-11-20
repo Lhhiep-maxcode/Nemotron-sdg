@@ -112,6 +112,7 @@ engine:
   max_tools: 6
   min_hops: 0
   force_first_tool: false
+  require_reasoning: true
   persona_voice: false
   gate_query: false
   inline_judge: false
@@ -151,6 +152,54 @@ Ensure your served context window fits the prompt plus requested completion;
 compression uses estimates and retains recent tool results, so its threshold is
 not a strict model context limit. Model availability, context capacity, endpoint
 access, and the cluster persona path require checking on your deployment.
+
+## Assistant reasoning
+
+The assistant's returned reasoning is saved inside each assistant message:
+
+```json
+{"role": "assistant", "reasoning_content": "Model-returned reasoning text.", "content": "Final answer."}
+```
+
+Assistant messages that call tools also keep `reasoning_content` beside
+`tool_calls`. The outer record still has only `messages`, `tools` and `id`.
+Both the current vLLM `reasoning` field and the older `reasoning_content` field
+are normalized to `reasoning_content`; a complete leading `<think>...</think>`
+block is also supported. Missing reasoning is never synthesized from the answer.
+
+Thinking is now explicitly requested for `assistant_model` in
+`config/pipeline.yaml`:
+
+```yaml
+inference_parameters:
+  temperature: 0.7
+  max_tokens: 65536
+  extra_body:
+    include_reasoning: true
+    chat_template_kwargs:
+      thinking: true
+      reasoning_effort: 25
+```
+
+The thinking controls follow the official
+[vLLM DeepSeek V4.1 recipe](https://github.com/vllm-project/recipes/blob/main/models/deepseek-ai/DeepSeek-V4.1-Flash.yaml).
+Ensure the matching `deepseek_v41` reasoning parser is enabled on your existing
+vLLM server. Other model aliases retain their existing request parameters.
+For the field-name change and response visibility, see
+[vLLM reasoning outputs](https://docs.vllm.ai/en/latest/features/reasoning_outputs/).
+
+`engine.require_reasoning: true` rejects a newly generated sample if any saved
+assistant message has no nonempty reasoning. Rejected samples are logged as
+failures and retried when resuming. Set this to false to allow messages without
+reasoning while keeping whatever reasoning the server returns. Reasoning and
+answer tokens share the completion budget; allow enough tokens for both and run
+a small smoke test against your endpoint first. Saving reasoning does not replay
+old reasoning in subsequent model requests; the existing compact input view is
+retained. The evaluator keeps reasoning unless you pass `--strip-reasoning`.
+
+Restart the runner to load these settings. Existing completed samples are skipped
+on resume, so use a new output directory to regenerate previously saved samples
+with reasoning.
 
 ## Tools and document scope
 

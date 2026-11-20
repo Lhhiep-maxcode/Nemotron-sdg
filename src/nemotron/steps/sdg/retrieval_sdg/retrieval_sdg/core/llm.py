@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 from collections import Counter
 from contextvars import ContextVar
 from typing import Any, Dict, List
@@ -137,13 +138,32 @@ def _tc_to_dict(tc: Any) -> Dict[str, Any]:
                          "arguments": getattr(fn, "arguments", "{}") if fn is not None else "{}"}}
 
 
+def message_text_and_reasoning(msg: Any) -> tuple[str, str]:
+    """Normalize returned reasoning fields, or a complete leading <think> block."""
+    def get(key):
+        return msg.get(key) if isinstance(msg, dict) else getattr(msg, key, None)
+
+    content = get("content") or ""
+    reasoning = get("reasoning_content")
+    if not isinstance(reasoning, str) or not reasoning.strip():
+        reasoning = get("reasoning")
+    if not isinstance(reasoning, str) or not reasoning.strip():
+        reasoning = ""
+        if isinstance(content, str):
+            tagged = re.match(r"\A\s*<think>(.*?)</think>(.*)\Z", content, flags=re.DOTALL)
+            if tagged:
+                reasoning = tagged.group(1).strip()
+                content = tagged.group(2).lstrip("\r\n")
+    return content, reasoning
+
+
 def _choice_to_dict(choice: Any) -> Dict[str, Any]:
     msg = choice.message
+    content, rc = message_text_and_reasoning(msg)
     result: Dict[str, Any] = {"role": getattr(msg, "role", "assistant"),
-                              "content": getattr(msg, "content", "") or ""}
+                              "content": content}
     # reasoning models expose the trace as `reasoning_content` (NVIDIA NIM) OR
     # `reasoning` (vLLM) — capture whichever is present, normalize to one key.
-    rc = getattr(msg, "reasoning_content", None) or getattr(msg, "reasoning", None)
     if rc:
         result["reasoning_content"] = rc
     if getattr(msg, "tool_calls", None):
@@ -167,9 +187,10 @@ def call_llm(models: Dict[str, Any], alias: str, messages: List[Dict[str, Any]],
 
 
 def _message_to_dict(msg: Any) -> Dict[str, Any]:
-    out: Dict[str, Any] = {"role": "assistant", "content": getattr(msg, "content", "") or ""}
-    if getattr(msg, "reasoning_content", None):
-        out["reasoning_content"] = msg.reasoning_content
+    content, reasoning = message_text_and_reasoning(msg)
+    out: Dict[str, Any] = {"role": "assistant", "content": content}
+    if reasoning:
+        out["reasoning_content"] = reasoning
     tcs = getattr(msg, "tool_calls", None) or []
     if tcs:
         out["tool_calls"] = [{"id": getattr(t, "id", None) or f"call_{i}", "type": "function",

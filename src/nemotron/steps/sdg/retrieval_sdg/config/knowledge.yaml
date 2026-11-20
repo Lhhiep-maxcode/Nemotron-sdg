@@ -115,6 +115,7 @@ engine:
   max_tools: 6                       # offer all six tools; use them when helpful
   min_hops: 0
   force_first_tool: false
+  require_reasoning: true            # save only samples with reasoning on every assistant message
   persona_voice: false
   gate_query: false
   inline_judge: false

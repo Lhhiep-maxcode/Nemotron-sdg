@@ -369,6 +369,10 @@ def test_merged_config_offers_six_tools_without_search_and_three_to_twenty_turns
     engine = _engine_config(cfg)
     assert (engine.min_turns, engine.max_turns, engine.max_tools) == (3, 20, 6)
     assert engine.retrieval_tools == [] and engine.min_hops == 0 and not engine.force_first_tool
+    assert engine.require_reasoning
+    request_options = engine.model_clients["assistant_model"]["params"]["extra_body"]
+    assert request_options["include_reasoning"]
+    assert request_options["chat_template_kwargs"] == {"thinking": True, "reasoning_effort": 25}
     cfg["engine"]["min_turns"] = 21
     with pytest.raises(ValueError, match="min_turns"):
         _engine_config(cfg)
@@ -424,7 +428,8 @@ def test_personas_are_loaded_once_and_selected_deterministically(tmp_path, monke
 
         def generate(self, data):
             captured.append(data["persona"])
-            return {"conversation_messages": '[{"role":"assistant","content":"answer"}]',
+            return {"conversation_messages": '[{"role":"assistant","content":"answer",'
+                                               '"reasoning_content":"Mock model rationale."}]',
                     "conversation_status": True}
 
     monkeypatch.setattr(persona_loader, "load_persona_pool", tracked_load)
@@ -494,13 +499,41 @@ def test_source_grounded_answers_can_finish_without_forced_tool_calls(monkeypatc
         assert kwargs["tool_choice"] == "auto"
         assert "search" not in {tool["function"]["name"] for tool in tools}
         source = source_passages_from_messages(messages)[0]
-        return {"content": f"{source['text']} [{source['id']}]"}
+        return {"content": f"{source['text']} [{source['id']}]",
+                "reasoning_content": "The source explicitly provides the requested value."}
 
     monkeypatch.setattr(engine_module, "call_llm_with_majority_vote", answer)
     row = synthesize(b'{"text":"The source value is 54."}', "sample", {}, cfg, _engine_config(cfg))
     assert [message["role"] for message in row["messages"]] == ["system", "user", "assistant"]
     assert "The source value is 54." in row["messages"][-1]["content"]
     assert len(row["tools"]) == 6 and set(row) == {"messages", "tools", "id"}
+    assert row["messages"][-1]["reasoning_content"]
+
+
+@pytest.mark.parametrize("missing", ["tool", "answer"])
+def test_required_reasoning_rejects_missing_tool_or_final_rationale(monkeypatch, missing):
+    from retrieval_sdg import streaming
+    from retrieval_sdg.conversation import engine as engine_module
+    cfg = _config()
+    cfg["persona"]["enabled"] = False
+    cfg["engine"].update(min_turns=1, max_turns=1)
+    monkeypatch.setattr(streaming, "call_llm", lambda *args: {"content": '{"query":"Double the value?"}'})
+    monkeypatch.setattr(engine_module, "configure_direct_clients", lambda *args: None)
+    responses = [
+        {"content": "", "reasoning_content": "" if missing == "tool" else "Use the calculator.", "tool_calls": [
+            {"id": "call_1", "type": "function", "function": {
+                "name": "calculator", "arguments": '{"expression":"54*2"}'}}]},
+        {"content": "108.", "reasoning_content": "" if missing == "answer" else "Use the returned calculation."},
+    ]
+    pending = iter(responses)
+    monkeypatch.setattr(engine_module, "call_llm_with_majority_vote", lambda *args, **kwargs: next(pending))
+    raw = b'{"text":"The source value is 54."}'
+    with pytest.raises(ValueError, match="no reasoning_content"):
+        synthesize(raw, "sample", {}, cfg, _engine_config(cfg))
+    cfg["engine"]["require_reasoning"] = False
+    pending = iter(responses)
+    row = synthesize(raw, "sample", {}, cfg, _engine_config(cfg))
+    assert row["id"] == "sample" and row["messages"][-1]["content"] == "108."
 
 
 def test_evaluator_accepts_provided_sources_and_rejects_fabricated_citations():
@@ -572,9 +605,11 @@ def test_cli_multiprocess_generation_and_resume(tmp_path):
                 elif messages[-1]["role"] == "tool":
                     assert json.loads(messages[-1]["content"])["result"] == 108
                     chunk = source_passages_from_messages(messages)[0]
-                    message = {"role": "assistant", "content": f"RMR gấp đôi là 108 [{chunk['id']}]."}
+                    message = {"role": "assistant", "content": f"RMR gấp đôi là 108 [{chunk['id']}].",
+                               "reasoning_content": "The calculator returned double the provided source value."}
                 else:
-                    message = {"role": "assistant", "content": "", "tool_calls": [
+                    message = {"role": "assistant", "content": "", "reasoning": "Calculate using the provided value.",
+                               "tool_calls": [
                         {"id": "call_1", "type": "function", "function": {
                             "name": "calculator", "arguments": '{"expression":"54*2"}'}}]}
                 body = json.dumps({"id": "test", "object": "chat.completion", "created": 0,
@@ -635,6 +670,8 @@ def test_cli_multiprocess_generation_and_resume(tmp_path):
                 output_ids.add(row["id"])
                 assert len(row["tools"]) == 6
                 messages = row["messages"]
+                assert all(message.get("reasoning_content") for message in messages if message["role"] == "assistant")
+                assert all("reasoning" not in message for message in messages)
                 assert messages[-1]["role"] == "assistant" and not messages[-1].get("tool_calls")
                 calls = [call for message in messages for call in message.get("tool_calls", [])]
                 assert calls and all(ToolCallVerifier().verify_single(call, row["tools"])[0] for call in calls)
@@ -647,6 +684,8 @@ def test_cli_multiprocess_generation_and_resume(tmp_path):
         assert all(len(request["tools"]) == 6 and request["tool_choice"] == "auto"
                    and all(tool["function"]["name"] != "search" for tool in request["tools"])
                    for request in requests if request.get("tools"))
+        assert all(request["chat_template_kwargs"] == {"thinking": True, "reasoning_effort": 25}
+                   and request["include_reasoning"] is True for request in requests if request.get("tools"))
         assert sorted(output.rglob("*.jsonl")) == paths  # resume state stays outside the training output tree
         states = list(output.with_name(output.name + ".state").rglob("*.state.jsonl"))
         assert len(states) == 2

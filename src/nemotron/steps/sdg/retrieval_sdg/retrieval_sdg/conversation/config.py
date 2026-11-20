@@ -86,6 +86,7 @@ class ConversationSimulatorConfig(_Base):
     majority_vote_n: int = 1                       # assistant self-consistency samples
     max_tools: int = 12                            # tool subset offered per row
     persona_voice: bool = True                     # re-voice the seed query in the persona
+    require_reasoning: bool = False                # reject a sample if any saved assistant message lacks reasoning
 
     @property
     def side_effect_columns(self) -> List[str]:

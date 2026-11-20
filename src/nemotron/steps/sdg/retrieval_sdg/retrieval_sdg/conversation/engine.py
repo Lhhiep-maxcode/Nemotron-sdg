@@ -31,7 +31,7 @@ import json
 import random
 from typing import Any, Dict, List, Optional
 
-from ..core.llm import call_llm, call_llm_with_majority_vote, configure_direct_clients
+from ..core.llm import call_llm, call_llm_with_majority_vote, configure_direct_clients, message_text_and_reasoning
 from ..core.messages import format_history_compact, format_judge_history, format_tools_for_prompt
 from ..core.persona import format_persona_for_prompt
 from ..retrieval.client import HttpRetrievalClient
@@ -278,6 +278,13 @@ class ConversationEngine:
                          for m in messages)
         if not has_answer:
             return self._skipped(data, cfg, "no_grounded_answer", "no turn produced a grounded answer")
+        if cfg.require_reasoning:
+            missing = [i for i, message in enumerate(messages)
+                       if message.get("role") == "assistant" and not (message.get("reasoning_content") or "").strip()]
+            if missing:
+                raise ValueError(f"Assistant messages {missing} have no reasoning_content. "
+                                 "Enable thinking and the matching reasoning parser on the model server, "
+                                 "or set engine.require_reasoning: false to allow missing reasoning.")
         last = messages[-1] if messages else {}
         ends_on_answer = last.get("role") == "assistant" and not last.get("tool_calls") and bool(last.get("content"))
         status, judgment = ends_on_answer, {}
@@ -365,8 +372,8 @@ def _sanitize_tool_calls(tool_calls: list, tools: List[Dict[str, Any]]) -> list:
 
 def _assistant_msg(resp: Dict[str, Any], tool_calls: Optional[list] = None) -> Dict[str, Any]:
     """Build an assistant message that ALWAYS preserves the reasoning trace."""
-    msg: Dict[str, Any] = {"role": "assistant", "content": resp.get("content", "") or "",
-                           "reasoning_content": resp.get("reasoning_content", "") or ""}
+    content, reasoning = message_text_and_reasoning(resp)
+    msg: Dict[str, Any] = {"role": "assistant", "content": content, "reasoning_content": reasoning}
     if tool_calls:
         msg["tool_calls"] = tool_calls
     return msg
