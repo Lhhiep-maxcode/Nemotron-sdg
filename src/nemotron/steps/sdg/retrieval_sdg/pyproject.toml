@@ -12,6 +12,7 @@ dependencies = [
     "requests",                # Module A retrieval POST client
     "openai",                  # direct tool-calling clients + offline callers
     "pyyaml",
+    "omegaconf",               # configuration loading (pipeline and streaming runner)
 ]
 
 [project.optional-dependencies]

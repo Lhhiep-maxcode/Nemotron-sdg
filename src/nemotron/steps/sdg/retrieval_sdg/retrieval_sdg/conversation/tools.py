@@ -47,10 +47,11 @@ def sample_tools(all_tools: List[Dict[str, Any]], max_tools: int, must_include: 
 
 
 class ToolEnvironment:
-    def __init__(self, cfg, client, tools: List[Dict[str, Any]]):
+    def __init__(self, cfg, client, tools: List[Dict[str, Any]], *, handlers=None):
         self.cfg = cfg
         self.client = client
         self.tools = tools
+        self.handlers = handlers or {}
         self.retrieval_log: List[Dict[str, Any]] = []
         # progress signal only (NOT used to filter retrieval): ids seen so far, and
         # whether the current hop's retrieval brought anything new.
@@ -88,6 +89,8 @@ class ToolEnvironment:
             args = {}
         if self.is_retrieval(name) and self.client is not None:
             return self._retrieve(args, user_query, rng), True
+        if name in self.handlers:
+            return json.dumps(self.handlers[name](**args), ensure_ascii=False), False
         return self._simulate(name, args, models, user_query), False
 
     def _retrieve(self, args: Dict[str, Any], user_query: str, rng: random.Random) -> str:

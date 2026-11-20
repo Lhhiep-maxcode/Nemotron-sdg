@@ -52,6 +52,11 @@ serves an already-extracted JSONL corpus; it does not extract PDFs.
 
 ## Quick start
 
+For recursive knowledge-document JSONL input, per-sample saving/resume, and
+`--num-process` / `--concurrency-per-process`, use
+[`run_knowledge_sdg.py` and the knowledge runner instructions](README_KNOWLEDGE.md).
+Its paths and settings are in [`config/knowledge.yaml`](config/knowledge.yaml).
+
 Run from this directory:
 
 ```bash

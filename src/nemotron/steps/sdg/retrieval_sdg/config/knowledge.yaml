@@ -1,0 +1,56 @@
+# Edit this file, then run: python run_knowledge_sdg.py
+# Models, endpoints and inference parameters are inherited from pipeline.yaml.
+# Override providers/models here using the same schema if needed.
+pipeline_config: pipeline.yaml
+
+batch:
+  input_path: /workspace/storage-shared/nlp/datasets/RAW/Vietnamese/crawler/processed-data/books-and-literature/processed-giaoduc/survive
+  output_dir: /workspace/storage-shared/nlp/datasets/POST-TRAINING/SFT/VAI-SFT-v3/agentic_vmlu_by_hieplh8
+  num_process: 4
+  concurrency_per_process: 8
+  limit: null                        # optional smoke test: first N documents PER FILE
+  text_field: text
+  id_field: id
+  chunk_chars: 1800
+  overlap_chars: 200
+  query_chunks: 3                    # passages sampled for the opening question
+  max_chars_per_chunk: 1600
+  kind_weights: {multi_hop: 4, comparative: 3, exploratory: 2, factual: 2, ambiguous: 1}
+  seed: 7
+
+# Each document is an independent knowledge base: local search, no HTTP retriever
+# or embedding server needed. Only real source passages become tool evidence.
+retrieval:
+  endpoint: ""
+  tools: [search]
+
+persona:
+  enabled: false
+
+tools:
+  - type: function
+    function:
+      name: search
+      description: Search source passages about mathematics, literature, cooking, books, science or education. Refine the query to find definitions, explanations, examples, recipes and evidence. Write the query in the user's language.
+      parameters:
+        type: object
+        properties:
+          query: {type: string, description: A focused search query for the source knowledge base.}
+        required: [query]
+        additionalProperties: false
+  - type: function
+    function:
+      name: calculator
+      description: Calculate with numbers obtained from retrieved evidence, such as ratios, percentages, recipe scaling and arithmetic. Supports parentheses and + - * / // % **. Use a decimal point, not a decimal comma. This tool supplies calculations, not factual evidence.
+      parameters:
+        type: object
+        properties:
+          expression: {type: string, description: A numerical arithmetic expression.}
+        required: [expression]
+        additionalProperties: false
+
+engine:
+  force_first_tool: true
+  persona_voice: false
+  gate_query: false
+  inline_judge: false
