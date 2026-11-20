@@ -10,14 +10,16 @@ import os
 import random
 import signal
 from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 from pathlib import Path
 
+from .checkpoint import CheckpointedJsonl
 from .conversation.config import ConversationSimulatorConfig
 from .conversation.engine import DirectConversationRunner
 from .core.llm import call_llm, configure_direct_clients
 from .query_gen.generate import generate_query
 from .query_gen.sampler import GenUnit
-from .retrieval.local import LocalRetrievalClient, calculate
+from .retrieval.local import LocalRetrievalClient, knowledge_tool_handlers
 
 
 def output_path(input_file: Path, input_root: Path, output_dir: Path) -> Path:
@@ -29,45 +31,6 @@ def _append(handle, row: dict) -> None:
     handle.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
     handle.flush()
     os.fsync(handle.fileno())
-
-
-def completed_samples(path: Path) -> set[str]:
-    """Use raw.jsonl as the checkpoint; repair only an interrupted final record.
-
-    A complete JSON record missing its newline is retained. Corruption before the
-    final record is an error, so existing successful data cannot be silently lost.
-    """
-    done: set[str] = set()
-    if not path.exists():
-        return done
-    with path.open("r+b") as handle:
-        while True:
-            start = handle.tell()
-            line = handle.readline()
-            if not line:
-                break
-            if not line.strip():
-                continue
-            try:
-                row = json.loads(line)
-            except (ValueError, UnicodeError):
-                if handle.read(1):
-                    raise ValueError(f"Corrupt output before EOF: {path}, byte {start}")
-                handle.seek(start)
-                handle.truncate()
-                handle.flush()
-                os.fsync(handle.fileno())
-                print(f"[resume] removed interrupted final record from {path}", flush=True)
-                break
-            if not isinstance(row, dict) or not isinstance(row.get("sample_id"), str) or not row["sample_id"]:
-                raise ValueError(f"Output has no sample_id: {path}, byte {start}")
-            done.add(row["sample_id"])
-            if not line.endswith(b"\n"):
-                handle.seek(0, os.SEEK_END)
-                handle.write(b"\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-    return done
 
 
 def _engine_config(cfg: dict) -> ConversationSimulatorConfig:
@@ -87,7 +50,27 @@ def _engine_config(cfg: dict) -> ConversationSimulatorConfig:
     knobs.update(name=engine.get("column_name", "conversation_messages"), model_clients=models,
                  retrieval_endpoint="", retrieval_tools=["search"], top_k=int(retrieval.get("top_k", 4)),
                  oversample_factor=int(retrieval.get("oversample_factor", 2)))
-    return ConversationSimulatorConfig(**knobs)
+    config = ConversationSimulatorConfig(**knobs)
+    if not 1 <= config.min_turns <= config.max_turns:
+        raise ValueError("Require 1 <= engine.min_turns <= engine.max_turns")
+    return config
+
+
+@lru_cache(maxsize=1)
+def _load_personas(config_json: str) -> list[dict]:
+    from .core.persona_loader import load_persona_pool
+    try:
+        pool = load_persona_pool(json.loads(config_json))
+    except SystemExit as exc:
+        raise ValueError(str(exc)) from exc  # report a file error instead of killing a pool worker
+    if not pool:
+        raise ValueError("The configured persona dataset is empty")
+    return pool
+
+
+def _personas(cfg: dict) -> list[dict]:
+    config = cfg.get("persona", {}) or {}
+    return _load_personas(json.dumps(config, sort_keys=True)) if config.get("enabled", False) else []
 
 
 def synthesize(raw: bytes, sample_id: str, source: dict, cfg: dict,
@@ -100,7 +83,10 @@ def synthesize(raw: bytes, sample_id: str, source: dict, cfg: dict,
     text = record.get(batch.get("text_field", "text"))
     if not isinstance(text, str) or not text.strip():
         raise ValueError("Input row has no nonempty text field")
-    doc_id = str(record.get(batch.get("id_field", "id")) or sample_id)
+    original_id = record.get(batch.get("id_field", "id"))
+    if original_id is None:
+        original_id = sample_id
+    doc_id = str(original_id)
     client = LocalRetrievalClient(text, sample_id, doc_id,
                                   chunk_chars=int(batch.get("chunk_chars", 1800)),
                                   overlap_chars=int(batch.get("overlap_chars", 200)),
@@ -120,32 +106,32 @@ def synthesize(raw: bytes, sample_id: str, source: dict, cfg: dict,
     if seed is None:
         raise ValueError("Question generation returned no valid query")
     seed.update(cluster_id=f"doc_{sample_id[:12]}", tools=cfg["tools"])
+    personas = _personas(cfg)
+    if personas:
+        persona_rng = random.Random(f"{cfg['persona'].get('seed', 7)}:{sample_id}")
+        seed[engine_config.persona_column] = dict(personas[persona_rng.randrange(len(personas))])
     runner = DirectConversationRunner(engine_config, client=client,
-                                      tool_handlers={"calculator": calculate})
+                                      tool_handlers=knowledge_tool_handlers())
     generated = runner.generate(seed)
     messages = json.loads(generated["conversation_messages"])
     if not messages or not generated.get("conversation_status"):
         raise ValueError(f"No completed conversation: {generated.get('trajectory_judgment', '')}")
-    row = {"sample_id": sample_id, "source": {**source, "id": doc_id},
-           "query": seed["query"], "kind": kind, "messages": messages, "tools": cfg["tools"]}
-    metadata = cfg.get("engine", {}).get("metadata_fields", ["cluster_id", "hops_taken", "retrieval_log"])
-    for key in metadata:
-        if key in generated:
-            row[key] = generated[key]
-    return row
+    return {"messages": messages, "tools": cfg["tools"], "id": sample_id}
 
 
 async def process_file(cfg: dict, input_file: Path, relative: str, out: Path,
-                       *, synthesizer=None) -> dict:
+                       *, synthesizer=None, error_path: Path | None = None,
+                       checkpoint_path: Path | None = None) -> dict:
     batch = cfg["batch"]
     concurrency = int(batch["concurrency_per_process"])
     if concurrency < 1:
         raise ValueError("concurrency_per_process must be positive")
-    done = completed_samples(out)
-    out.parent.mkdir(parents=True, exist_ok=True)
+    writer = CheckpointedJsonl(out, checkpoint_path)
+    done = writer.done
     stats = {"saved": 0, "resumed": 0, "failed": 0}
     engine_config = _engine_config(cfg) if synthesizer is None else None
     if synthesizer is None:
+        _personas(cfg)  # load once per file worker; cached across its samples and files
         configure_direct_clients(engine_config.model_clients)  # initialize once, before threads start
         synthesizer = synthesize
     queue = asyncio.Queue(maxsize=2 * concurrency)
@@ -172,7 +158,7 @@ async def process_file(cfg: dict, input_file: Path, relative: str, out: Path,
     # Writes occur on the event loop, so concurrent samples never interleave lines.
     # Keep the executor explicit: asyncio's default pool can otherwise cap large
     # --concurrency-per-process values at 32 threads.
-    with ThreadPoolExecutor(max_workers=concurrency) as executor, out.open("a", encoding="utf-8") as output:
+    with ThreadPoolExecutor(max_workers=concurrency) as executor, writer:
         loop = asyncio.get_running_loop()
 
         async def consume():
@@ -184,14 +170,15 @@ async def process_file(cfg: dict, input_file: Path, relative: str, out: Path,
                 try:
                     row = await loop.run_in_executor(executor, synthesizer, raw, sample_id, source, cfg, engine_config)
                 except Exception as exc:
-                    with out.with_suffix(".errors.jsonl").open("a", encoding="utf-8") as errors:
+                    error_file = error_path or out.with_suffix(".errors.jsonl")
+                    error_file.parent.mkdir(parents=True, exist_ok=True)
+                    with error_file.open("a", encoding="utf-8") as errors:
                         _append(errors, {"sample_id": sample_id, "source": source,
                                          "error": f"{type(exc).__name__}: {exc}"})
                     stats["failed"] += 1
                     print(f"[{relative}:{source['line']}] failed: {exc}", flush=True)
                 else:
-                    _append(output, row)  # durable output IS the completion marker
-                    done.add(sample_id)
+                    writer.append(sample_id, row)
                     stats["saved"] += 1
                     print(f"[{relative}] saved={stats['saved']} resumed={stats['resumed']} "
                           f"failed={stats['failed']}", flush=True)
@@ -211,7 +198,13 @@ def _ignore_interrupt():
 
 
 def _run_file(cfg: dict, path: Path, relative: str, out: Path) -> dict:
-    return asyncio.run(process_file(cfg, path, relative, out))
+    output_dir = Path(cfg["batch"]["output_dir"])
+    error_root = output_dir.with_name(output_dir.name + ".errors")
+    error_path = error_root / Path(relative).with_suffix(".errors.jsonl")
+    checkpoint_root = output_dir.with_name(output_dir.name + ".state")
+    checkpoint_path = checkpoint_root / Path(relative).with_suffix(".state.jsonl")
+    return asyncio.run(process_file(cfg, path, relative, out, error_path=error_path,
+                                    checkpoint_path=checkpoint_path))
 
 
 def run_directory(cfg: dict) -> int:

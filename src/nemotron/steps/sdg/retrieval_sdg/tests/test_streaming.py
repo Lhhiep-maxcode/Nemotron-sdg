@@ -1,6 +1,7 @@
 """Offline checks for incremental output, resume and the real multiprocessing CLI."""
 
 import asyncio
+import hashlib
 import json
 import os
 import random
@@ -15,9 +16,17 @@ from pathlib import Path
 
 import pytest
 from omegaconf import OmegaConf
+from retrieval_sdg.checkpoint import CheckpointedJsonl, completed_samples
 from retrieval_sdg.conversation.verifiers import ToolCallVerifier
-from retrieval_sdg.retrieval.local import LocalRetrievalClient, calculate
-from retrieval_sdg.streaming import completed_samples, output_path, process_file
+from retrieval_sdg.retrieval.local import LocalRetrievalClient, calculate, knowledge_tool_handlers
+from retrieval_sdg.streaming import (
+    _engine_config,
+    _load_personas,
+    _personas,
+    output_path,
+    process_file,
+    synthesize,
+)
 
 HERE = Path(__file__).resolve().parents[1]
 
@@ -27,8 +36,13 @@ def _rows(path):
 
 
 def _result(sample_id, source):
-    return {"sample_id": sample_id, "source": source,
-            "messages": [{"role": "assistant", "content": "completed"}]}
+    return {"id": sample_id, "tools": [],
+            "messages": [{"role": "assistant", "content": str(source["line"])}]}
+
+
+def _config():
+    return OmegaConf.to_container(OmegaConf.merge(OmegaConf.load(HERE / "config/pipeline.yaml"),
+                                                 OmegaConf.load(HERE / "config/knowledge.yaml")), resolve=True)
 
 
 def test_writes_before_slow_sample_finishes_and_bounds_concurrency(tmp_path):
@@ -64,7 +78,7 @@ def test_writes_before_slow_sample_finishes_and_bounds_concurrency(tmp_path):
                 assert asyncio.get_running_loop().time() < deadline
                 await asyncio.sleep(0.01)
             assert not task.done()
-            assert _rows(out)[0]["source"]["line"] == 2
+            assert _rows(out)[0]["messages"][0]["content"] == "2"
         finally:
             release.set()
             stats = await task
@@ -90,7 +104,7 @@ def test_resume_retries_only_failures_and_repairs_partial_tail(tmp_path):
 
     stats = asyncio.run(process_file(cfg, source, "x/input.jsonl", out, synthesizer=generate))
     assert stats == {"saved": 2, "resumed": 0, "failed": 1}
-    assert {row["source"]["line"] for row in _rows(out)} == {1, 4}
+    assert {row["messages"][0]["content"] for row in _rows(out)} == {"1", "4"}
     with out.open("ab") as handle:
         handle.write(b'{"sample_id": "interrupted", "messages": [')
     calls.clear()
@@ -98,7 +112,8 @@ def test_resume_retries_only_failures_and_repairs_partial_tail(tmp_path):
     stats = asyncio.run(process_file(cfg, source, "x/input.jsonl", out, synthesizer=generate))
     assert stats == {"saved": 1, "resumed": 2, "failed": 0}
     assert calls == [3]
-    assert len({row["sample_id"] for row in _rows(out)}) == 3
+    assert len({row["id"] for row in _rows(out)}) == 3
+    assert all(set(row) == {"messages", "tools", "id"} for row in _rows(out))
     calls.clear()
     stats = asyncio.run(process_file(cfg, source, "x/input.jsonl", out, synthesizer=generate))
     assert stats == {"saved": 0, "resumed": 3, "failed": 0}
@@ -122,14 +137,220 @@ def test_concurrency_can_exceed_default_asyncio_executor_size(tmp_path):
 
 def test_resume_preserves_complete_row_without_newline_and_rejects_middle_corruption(tmp_path):
     path = tmp_path / "raw.jsonl"
-    path.write_bytes(b'{"sample_id":"ok"}')
+    with CheckpointedJsonl(path) as writer:
+        writer.append("ok", {"id": "original-id", "messages": [], "tools": []})
+    path.write_bytes(path.read_bytes().rstrip(b"\n"))
     assert completed_samples(path) == {"ok"}
     assert path.read_bytes().endswith(b"\n")
-    bad = b'{"sample_id":"ok"}\nBAD\n{"sample_id":"also-ok"}\n'
+    with CheckpointedJsonl(path) as writer:
+        writer.append("also-ok", {"id": "another-original-id", "messages": [], "tools": []})
+    first, second = path.read_bytes().splitlines(keepends=True)
+    bad = first + b"BAD\n" + second
     path.write_bytes(bad)
     with pytest.raises(ValueError, match="before EOF"):
         completed_samples(path)
     assert path.read_bytes() == bad
+
+
+def test_legacy_output_is_normalized_without_losing_resume_ids(tmp_path):
+    path = tmp_path / "raw.jsonl"
+    legacy = {"sample_id": "old", "messages": [{"role": "assistant", "content": "answer"}],
+              "tools": [], "source": {"file": "book.jsonl", "line": 1, "id": "original-source-id"},
+              "query": "question", "hops_taken": 2}
+    current = {"id": "new", "messages": [], "tools": []}
+    path.write_text(json.dumps(legacy) + "\n" + json.dumps(current) + "\n", encoding="utf-8")
+    assert completed_samples(path) == {"old", "new"}
+    assert _rows(path) == [{"messages": legacy["messages"], "tools": [], "id": "old"}, current]
+    assert completed_samples(path) == {"old", "new"}
+
+
+@pytest.mark.parametrize("fail_after_checkpoint", [False, True])
+def test_failed_legacy_conversion_leaves_original_file_intact(tmp_path, monkeypatch, fail_after_checkpoint):
+    path = tmp_path / "raw.jsonl"
+    original = json.dumps({"sample_id": "old", "messages": [], "tools": [], "query": "q"}) + "\n"
+    path.write_text(original, encoding="utf-8")
+    replace = Path.replace
+
+    def fail_replace(self, target):
+        fail_target = path if fail_after_checkpoint else path.with_suffix(".state.jsonl")
+        if Path(target) == fail_target:
+            raise OSError("interrupted migration")
+        return replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", fail_replace)
+    with pytest.raises(OSError, match="interrupted migration"):
+        completed_samples(path)
+    assert path.read_text(encoding="utf-8") == original
+    assert not list(tmp_path.glob("*.tmp"))
+    monkeypatch.setattr(Path, "replace", replace)
+    assert completed_samples(path) == {"old"}
+    assert set(_rows(path)[0]) == {"messages", "tools", "id"}
+
+
+@pytest.mark.parametrize("stage", ["before_output", "partial_output", "after_output", "partial_journal"])
+def test_checkpoint_recovers_each_write_boundary(tmp_path, monkeypatch, stage):
+    from retrieval_sdg import checkpoint as checkpoint_module
+    path = tmp_path / "raw.jsonl"
+    row = {"id": "same-original-id", "messages": [], "tools": []}
+    sync_write = checkpoint_module._sync_write
+
+    def interrupted_write(handle, text):
+        is_output = Path(handle.name) == path
+        if stage == "partial_journal" and not is_output:
+            handle.write(text[:15])
+            handle.flush()
+            raise OSError("interrupted journal")
+        if is_output:
+            if stage == "partial_output":
+                handle.write(text[:15])
+                handle.flush()
+            if stage == "after_output":
+                sync_write(handle, text)
+            raise OSError("interrupted output")
+        sync_write(handle, text)
+
+    with CheckpointedJsonl(path) as writer:
+        writer.append("sample-1", row)
+        monkeypatch.setattr(checkpoint_module, "_sync_write", interrupted_write)
+        with pytest.raises(OSError, match="interrupted"):
+            writer.append("sample-2", row)
+        with pytest.raises(RuntimeError, match="previous output write failed"):
+            writer.append("sample-3", row)
+    monkeypatch.setattr(checkpoint_module, "_sync_write", sync_write)
+    expected = {"sample-1", "sample-2"} if stage == "after_output" else {"sample-1"}
+    assert completed_samples(path) == expected
+    with CheckpointedJsonl(path) as writer:
+        writer.append("sample-3", row)
+    assert completed_samples(path) == expected | {"sample-3"}
+    assert len(_rows(path)) == len(expected) + 1
+    assert {record["id"] for record in _rows(path)} == expected | {"sample-3"}
+    assert all(record["messages"] == row["messages"] and record["tools"] == row["tools"] for record in _rows(path))
+
+
+def test_original_id_output_requires_its_matching_checkpoint(tmp_path):
+    path = tmp_path / "raw.jsonl"
+    path.write_text('{"id":"original", "messages":[], "tools":[]}\n', encoding="utf-8")
+    original = path.read_bytes()
+    with pytest.raises(ValueError, match="Keep the matching .state directory"):
+        completed_samples(path)
+    assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize("interruption", [None, "checkpoint", "output"])
+def test_document_id_outputs_migrate_to_sample_ids_without_regeneration(tmp_path, monkeypatch, interruption):
+    path = tmp_path / "raw.jsonl"
+    checkpoint = path.with_suffix(".state.jsonl")
+    original_rows = [{"id": "repeated-document-id", "messages": [{"role": "assistant", "content": f"Answer {i}"}],
+                      "tools": []} for i in range(2)]
+    payloads = [json.dumps(row, ensure_ascii=False) for row in original_rows]
+    path.write_text("\n".join(payloads) + "\n", encoding="utf-8")
+    checkpoint.write_text("".join(json.dumps({"sample_id": f"sample-{i}",
+                                             "sha256": hashlib.sha256(payload.encode()).hexdigest()}) + "\n"
+                                   for i, payload in enumerate(payloads)), encoding="utf-8")
+    original = path.read_bytes()
+    replace = Path.replace
+    if interruption:
+        def fail_replace(self, target):
+            if Path(target) == (checkpoint if interruption == "checkpoint" else path):
+                raise OSError("interrupted ID migration")
+            return replace(self, target)
+
+        monkeypatch.setattr(Path, "replace", fail_replace)
+        with pytest.raises(OSError, match="interrupted ID migration"):
+            completed_samples(path)
+        assert path.read_bytes() == original
+        assert not list(tmp_path.glob("*.tmp"))
+        monkeypatch.setattr(Path, "replace", replace)
+    assert completed_samples(path) == {"sample-0", "sample-1"}
+    assert _rows(path) == [{**row, "id": f"sample-{i}"} for i, row in enumerate(original_rows)]
+    converted = path.read_bytes()
+    assert completed_samples(path) == {"sample-0", "sample-1"}
+    assert path.read_bytes() == converted
+
+
+def test_merged_config_offers_seven_tools_and_three_to_twenty_turns():
+    cfg = _config()
+    expected = {"search", "calculator", "memory_read", "memory_write", "translation",
+                "citation_format", "timeline_extract"}
+    assert {tool["function"]["name"] for tool in cfg["tools"]} == expected
+    assert len(cfg["tools"]) == 7 and all(tool["type"] == "function" for tool in cfg["tools"])
+    engine = _engine_config(cfg)
+    assert (engine.min_turns, engine.max_turns, engine.max_tools) == (3, 20, 7)
+    cfg["engine"]["min_turns"] = 21
+    with pytest.raises(ValueError, match="min_turns"):
+        _engine_config(cfg)
+
+
+def test_memory_is_shared_within_a_conversation_and_isolated_between_samples():
+    handlers = knowledge_tool_handlers()
+    assert handlers["memory_read"]("citation_style") == {"key": "citation_style", "found": False, "value": None}
+    assert handlers["memory_write"]("citation_style", "inline")["stored"]
+    assert handlers["memory_read"]("citation_style")["value"] == "inline"
+    assert not knowledge_tool_handlers()["memory_read"]("citation_style")["found"]
+
+
+def test_auxiliary_tools_use_aux_response_model(monkeypatch):
+    from retrieval_sdg.conversation import tools as tool_module
+    cfg = _config()
+    calls = []
+
+    def fake_llm(models, alias, messages):
+        calls.append((alias, messages))
+        return {"content": '{"transformed":true}'}
+
+    monkeypatch.setattr(tool_module, "call_llm", fake_llm)
+    env = tool_module.ToolEnvironment(_engine_config(cfg), None, cfg["tools"], handlers=knowledge_tool_handlers())
+    for name in ("translation", "citation_format", "timeline_extract"):
+        content, retrieved = env.respond({"function": {"name": name, "arguments": "{}"}}, {}, "q", random.Random(7))
+        assert json.loads(content) == {"transformed": True} and not retrieved
+        assert name in calls[-1][1][-1]["content"]
+    assert [alias for alias, _ in calls] == ["aux_response_model"] * 3
+    env.respond({"function": {"name": "memory_write", "arguments": '{"key":"k","value":"v"}'}},
+                {}, "q", random.Random(7))
+    assert len(calls) == 3
+
+
+def test_personas_are_loaded_once_and_selected_deterministically(tmp_path, monkeypatch):
+    from retrieval_sdg import streaming
+    from retrieval_sdg.core import persona_loader
+    path = tmp_path / "personas.jsonl"
+    path.write_text('{"persona":"A curious student."}\n{"persona":"A teacher."}\n', encoding="utf-8")
+    cfg = _config()
+    cfg["persona"] = {"enabled": True, "local_path": str(path), "seed": 7}
+    _load_personas.cache_clear()
+    calls, captured = [], []
+    load = persona_loader.load_persona_pool
+
+    def tracked_load(config):
+        calls.append(config)
+        return load(config)
+
+    class FakeRunner:
+        def __init__(self, config, **kwargs):
+            pass
+
+        def generate(self, data):
+            captured.append(data["persona"])
+            return {"conversation_messages": '[{"role":"assistant","content":"answer"}]',
+                    "conversation_status": True}
+
+    monkeypatch.setattr(persona_loader, "load_persona_pool", tracked_load)
+    monkeypatch.setattr(streaming, "call_llm", lambda *args: {"content": '{"query":"question"}'})
+    monkeypatch.setattr(streaming, "DirectConversationRunner", FakeRunner)
+    engine = _engine_config(cfg)
+    raw = b'{"id":"document", "text":"Source text with sufficient content."}'
+    first = synthesize(raw, "sample", {"file": "book.jsonl", "line": 1}, cfg, engine)
+    second = synthesize(raw, "sample", {"file": "book.jsonl", "line": 1}, cfg, engine)
+    assert first == second and set(first) == {"messages", "tools", "id"} and first["id"] == "sample"
+    assert captured[0] == captured[1] and captured[0] in _personas(cfg)
+    assert len(calls) == 1
+    assert synthesize(b'{"id":0,"text":"Source text."}', "zero-sample", {}, cfg, engine)["id"] == "zero-sample"
+    assert synthesize(b'{"text":"Source text."}', "missing-id", {}, cfg, engine)["id"] == "missing-id"
+
+
+def test_missing_persona_file_is_reported_without_exiting_the_worker(tmp_path):
+    with pytest.raises(ValueError, match="local_path not found"):
+        _personas({"persona": {"enabled": True, "local_path": str(tmp_path / "missing.jsonl")}})
 
 
 def test_relative_output_paths_do_not_flatten_names(tmp_path):
@@ -212,12 +433,13 @@ def test_cli_multiprocess_generation_and_resume(tmp_path):
         for rel in ("math/data.jsonl", "books/data.jsonl"):
             path = inp / rel
             path.parent.mkdir(parents=True)
-            path.write_text("".join(json.dumps({"id": f"{rel}:{i}", "text": "Đá granit có RMR bằng 54."},
+            path.write_text("".join(json.dumps({"id": "repeated-source-id", "text": "Đá granit có RMR bằng 54."},
                                               ensure_ascii=False) + "\n" for i in range(2)), encoding="utf-8")
         settings = OmegaConf.load(HERE / "config/knowledge.yaml")
         settings.pipeline_config = str(HERE / "config/pipeline.yaml")
         settings.batch.num_process = 1  # CLI flags must override these settings
         settings.batch.concurrency_per_process = 1
+        settings.persona.enabled = False
         settings.engine.min_turns = settings.engine.max_turns = 1
         settings.engine.min_hops = 1
         config_path = tmp_path / "knowledge.yaml"
@@ -236,10 +458,16 @@ def test_cli_multiprocess_generation_and_resume(tmp_path):
         assert len(requests) == 12  # question, search call, final answer per source row
         paths = sorted(output.rglob("*.raw.jsonl"))
         assert len(paths) == 2
+        output_ids = set()
         for path in paths:
             rows = _rows(path)
             assert len(rows) == 2
             for row in rows:
+                assert set(row) == {"messages", "tools", "id"}
+                assert re.fullmatch(r"[0-9a-f]{64}", row["id"])
+                assert row["id"] not in output_ids
+                output_ids.add(row["id"])
+                assert len(row["tools"]) == 7
                 messages = row["messages"]
                 assert messages[-1]["role"] == "assistant" and not messages[-1].get("tool_calls")
                 calls = [call for message in messages for call in message.get("tool_calls", [])]
@@ -249,12 +477,27 @@ def test_cli_multiprocess_generation_and_resume(tmp_path):
                 cited = set(re.findall(r"h[0-9a-f]{12}", messages[-1]["content"]))
                 assert len(cited) == 1 and cited <= {chunk["id"] for chunk in chunks}
                 assert all(chunk["text"] == "Đá granit có RMR bằng 54." for chunk in chunks)
+        assert all(len(request["tools"]) == 7 for request in requests if request.get("tools"))
+        assert sorted(output.rglob("*.jsonl")) == paths  # resume state stays outside the training output tree
+        states = list(output.with_name(output.name + ".state").rglob("*.state.jsonl"))
+        assert len(states) == 2
+        assert {state["sample_id"] for path in states for state in _rows(path)} == output_ids
         before = {path: path.read_bytes() for path in paths}
         result = subprocess.run(command, cwd=tmp_path, env=env, capture_output=True, text=True,
                                 encoding="utf-8", timeout=45)
         assert result.returncode == 0, result.stdout + result.stderr
         assert len(requests) == 12  # no model calls for completed samples
         assert before == {path: path.read_bytes() for path in paths}
+        with (inp / "math/data.jsonl").open("a", encoding="utf-8") as handle:
+            handle.write('{"id":"bad-row-without-text"}\n')
+        result = subprocess.run(command, cwd=tmp_path, env=env, capture_output=True, text=True,
+                                encoding="utf-8", timeout=45)
+        assert result.returncode == 1, result.stdout + result.stderr
+        assert len(requests) == 12
+        assert sorted(output.rglob("*.jsonl")) == paths
+        assert before == {path: path.read_bytes() for path in paths}
+        error_file = output.with_name(output.name + ".errors") / "math/data.errors.jsonl"
+        assert _rows(error_file)[0]["source"] == {"file": "math/data.jsonl", "line": 3}
     finally:
         server.shutdown()
         server.server_close()

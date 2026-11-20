@@ -4,19 +4,19 @@
 pipeline_config: pipeline.yaml
 
 batch:
-  input_path: /workspace/storage-shared/nlp/datasets/RAW/Vietnamese/crawler/processed-data/books-and-literature/processed-giaoduc/survive
-  output_dir: /workspace/storage-shared/nlp/datasets/POST-TRAINING/SFT/VAI-SFT-v3/agentic_vmlu_by_hieplh8
-  num_process: 4
+  input_path: /workspace/storage-shared/nlp/datasets/RAW/Vietnamese/crawler/processed-data/books-and-literature/processed-book/survive
+  output_dir: /workspace/storage-shared/nlp/datasets/POST-TRAINING/SFT/VAI-SFT-v3/agentic_vmlu_by_hieplh8/processed-book
+  num_process: 128
   concurrency_per_process: 8
   limit: null                        # optional smoke test: first N documents PER FILE
   text_field: text
   id_field: id
-  chunk_chars: 1800
-  overlap_chars: 200
+  chunk_chars: 32768
+  overlap_chars: 1024
   query_chunks: 3                    # passages sampled for the opening question
-  max_chars_per_chunk: 1600
-  kind_weights: {multi_hop: 4, comparative: 3, exploratory: 2, factual: 2, ambiguous: 1}
-  seed: 7
+  max_chars_per_chunk: 32768
+  kind_weights: {multi_hop: 1, comparative: 3, exploratory: 3, factual: 3, ambiguous: 1}
+  seed: 42
 
 # Each document is an independent knowledge base: local search, no HTTP retriever
 # or embedding server needed. Only real source passages become tool evidence.
@@ -25,19 +25,22 @@ retrieval:
   tools: [search]
 
 persona:
-  enabled: false
+  enabled: true
+  # hf_dataset: nvidia/Nemotron-Personas-Vietnam   # HF repo id or full dataset URL
+  # hf_split: train
+  local_path: /workspace/storage-shared/nlp/users/hieplh8/data/Nemotron-Personas-Vietnam/data/train-00000-of-00001.parquet               # optional; skips HF download
+  seed: 7
 
 tools:
   - type: function
     function:
       name: search
-      description: Search source passages about mathematics, literature, cooking, books, science or education. Refine the query to find definitions, explanations, examples, recipes and evidence. Write the query in the user's language.
+      description: Retrieve the most relevant passages (chunks) from the knowledge base for a query.
       parameters:
         type: object
         properties:
-          query: {type: string, description: A focused search query for the source knowledge base.}
+          query: {type: string, description: The search query.}
         required: [query]
-        additionalProperties: false
   - type: function
     function:
       name: calculator
@@ -48,8 +51,76 @@ tools:
           expression: {type: string, description: A numerical arithmetic expression.}
         required: [expression]
         additionalProperties: false
+  - type: function
+    function:
+      name: memory_read
+      description: Read a preference or fact stored earlier in this generated conversation.
+      parameters:
+        type: object
+        properties:
+          key: {type: string, description: The preference/fact key to look up (e.g. "preferred_citation_style").}
+        required: [key]
+  - type: function
+    function:
+      name: memory_write
+      description: Store a user preference or fact for later turns in this generated conversation.
+      parameters:
+        type: object
+        properties:
+          key: {type: string, description: The preference/fact key to store.}
+          value: {type: string, description: The value to remember.}
+        required: [key, value]
+  - type: function
+    function:
+      name: translation
+      description: Translate a short user query, retrieved phrase, or final answer while preserving source-backed meaning.
+      parameters:
+        type: object
+        properties:
+          text: {type: string, description: The text to translate.}
+          target_language: {type: string, enum: [en, fr, es, de, vi], description: The requested output language.}
+          preserve_terms:
+            type: array
+            items: {type: string}
+            description: Domain terms or names that should not be translated.
+        required: [text, target_language]
+  - type: function
+    function:
+      name: citation_format
+      description: Format supplied retrieved identifiers in the requested citation style. Do not invent authors, titles, publication dates or source identifiers.
+      parameters:
+        type: object
+        properties:
+          source_ids:
+            type: array
+            items: {type: string}
+            description: Retrieved chunk or document identifiers to cite.
+          style:
+            type: string
+            enum: [inline, footnote, apa, mla, chicago, simple]
+            description: Citation style requested by the user.
+        required: [source_ids, style]
+  - type: function
+    function:
+      name: timeline_extract
+      description: Build a chronological timeline using only the supplied retrieved evidence snippets. Do not add events or dates absent from the snippets.
+      parameters:
+        type: object
+        properties:
+          snippets:
+            type: array
+            items: {type: string}
+            description: Evidence snippets that may contain dates or ordered events.
+          granularity:
+            type: string
+            enum: [day, month, year, sequence]
+            description: Desired timeline granularity.
+        required: [snippets]
 
 engine:
+  min_turns: 3
+  max_turns: 20
+  max_tools: 7                       # offer all seven tools; the assistant selects which to call
   force_first_tool: true
   persona_voice: false
   gate_query: false

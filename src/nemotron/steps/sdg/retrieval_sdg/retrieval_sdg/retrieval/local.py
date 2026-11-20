@@ -102,3 +102,17 @@ def calculate(expression: str) -> dict:
         return {"expression": expression, "result": evaluate(tree.body)}
     except (ValueError, SyntaxError, ArithmeticError, TypeError) as exc:
         return {"error": str(exc)}
+
+
+def knowledge_tool_handlers() -> dict:
+    """Fresh memory for one conversation, plus the deterministic calculator."""
+    memory = {}
+
+    def memory_read(key: str) -> dict:
+        return {"key": key, "found": key in memory, "value": memory.get(key)}
+
+    def memory_write(key: str, value: str) -> dict:
+        memory[key] = value
+        return {"key": key, "stored": True}
+
+    return {"calculator": calculate, "memory_read": memory_read, "memory_write": memory_write}

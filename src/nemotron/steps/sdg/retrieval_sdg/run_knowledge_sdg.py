@@ -32,6 +32,10 @@ def main() -> None:
     for key in ("input_path", "output_dir"):
         path = Path(batch[key]).expanduser()
         batch[key] = str(path if path.is_absolute() else (config_path.parent / path).resolve())
+    persona = cfg.get("persona", {}) or {}
+    if persona.get("local_path"):
+        path = Path(persona["local_path"]).expanduser()
+        persona["local_path"] = str(path if path.is_absolute() else (config_path.parent / path).resolve())
     try:
         failures = run_directory(cfg)
     except KeyboardInterrupt:

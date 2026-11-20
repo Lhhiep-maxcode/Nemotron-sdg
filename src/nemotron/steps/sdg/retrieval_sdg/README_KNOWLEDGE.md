@@ -15,6 +15,12 @@ The standalone runner needs:
 python -m pip install openai 'pydantic>=2' omegaconf
 ```
 
+Your supplied config enables a local Parquet persona dataset, which also needs:
+
+```bash
+python -m pip install pandas pyarrow
+```
+
 1. Edit [`config/knowledge.yaml`](config/knowledge.yaml). The requested input and
    output folders are already set. Adjust `batch.num_process` and
    `batch.concurrency_per_process`, plus chunk sizes and question-kind weights.
@@ -27,10 +33,17 @@ python -m pip install openai 'pydantic>=2' omegaconf
    ```bash
    export ASSISTANT_ENDPOINT=http://your-assistant-server:8000/v1
    export USER_MODEL_ENDPOINT=http://your-user-model-server:8000/v1
-   # For authenticated services:
+   # For authenticated services, set providers[*].api_key to the corresponding
+   # environment-variable NAME before exporting its value:
    export ASSISTANT_API_KEY=your-key
    export USER_MODEL_API_KEY=your-key
    ```
+
+   In your supplied providers, `api_key: dummy` refers to an environment variable
+   literally named `dummy`; it is not a literal API key. If unset, direct clients
+   send the placeholder `EMPTY`, which is suitable for an unauthenticated server.
+   `verify_ssl: false` is not consumed by the streaming direct client; your current
+   endpoint URLs use HTTP, so TLS verification does not apply.
 
 3. Execute the same file for both a new run and a resumed run:
 
@@ -59,6 +72,60 @@ the existing synchronous model/tool engine in a bounded thread pool. With 4 and
 8, at most 32 samples run concurrently; fewer input files reduce this total.
 `--limit N` selects the first N nonblank rows **per file**, including resumed rows.
 
+Your supplied config sets 128 processes and 8 samples per process: **up to 1,024
+concurrent samples**, with all model roles sharing the same endpoint. These values
+are preserved in the checked-in config. Choose concurrency to fit your model
+server capacity and available memory. Enabled personas are loaded and cached once
+per worker process, so their memory usage also scales with the process count.
+
+## Turn limits and model roles
+
+The knowledge config explicitly overrides these values:
+
+```yaml
+engine:
+  min_turns: 3
+  max_turns: 20
+  max_tools: 7
+  force_first_tool: true
+  persona_voice: false
+  gate_query: false
+  inline_judge: false
+```
+
+The planner samples a count between 3 and 20, favoring the middle of the range.
+A turn is a main user request plus the assistant's research and answer; tool calls
+are internal steps. Conversations can finish early when no follow-up or answer is
+produced, and clarification exchanges can add messages. `max_tools: 7` offers all
+seven tools; it does not require every conversation to call all seven.
+The inherited `max_tool_calls_per_turn: 3` limits each assistant tool-call batch;
+one research turn can contain multiple batches.
+
+| Model alias | Role |
+|---|---|
+| `assistant_model` | Chooses tools, researches, and writes the assistant's answers. |
+| `user_model` | Generates the opening question, follow-ups, and clarification replies. |
+| `aux_response_model` | Produces JSON responses for translation, citation formatting, and timeline extraction. |
+| `judge_model` | Checks queries/trajectories when generation gates are enabled, or scores output through `evaluate.py --judge`. |
+
+These are four roles, not a requirement to deploy four different models. Your
+provided config assigns `DeepSeek-V4.1-Flash-1017` to all four. The judge makes no
+generation calls while `gate_query` and `inline_judge` are both false.
+
+`persona.enabled: true` now attaches one reproducibly sampled persona to each
+conversation. With `persona_voice: false`, the opening query keeps its original
+wording, while generated follow-ups and clarification replies use that persona.
+The persona file must exist on the machine running the job. Set `persona.enabled`
+to false to skip persona loading.
+
+Your `chunk_chars: 32768`, `query_chunks: 3`, `max_chars_per_chunk: 32768`, and
+assistant `max_tokens: 65536` allow large requests. The query prompt alone can
+contain up to 98,304 source characters, and a search can return four full chunks.
+Ensure your served context window fits the prompt plus requested completion;
+compression uses estimates and retains recent tool results, so its threshold is
+not a strict model context limit. Model availability, context capacity, endpoint
+access, and the cluster persona path require checking on your deployment.
+
 ## Tools and document scope
 
 - `search`: real BM25 passage search within the current source document, with
@@ -67,12 +134,20 @@ the existing synchronous model/tool engine in a bounded thread pool. With 4 and
   education. It needs no retrieval or embedding service.
 - `calculator`: real, bounded arithmetic for ratios, percentages, recipe scaling
   and numerical exercises, using values from retrieved evidence.
+- `memory_read` / `memory_write`: real state shared across turns within one
+  generated conversation. It is isolated from other conversations and is not
+  persisted across independent samples or sessions.
+- `translation`: LLM-backed translation of the supplied text, with optional
+  preservation of domain terms.
+- `citation_format`: LLM-backed formatting of supplied retrieved identifiers;
+  bibliographic details that were not provided must not be invented.
+- `timeline_extract`: LLM-backed chronology from the supplied evidence snippets.
 
 Each document is a separate knowledge base. Multi-hop questions combine passages
 from that document. Questions follow the source language; follow-ups and answers
 follow the conversation language. Source text is treated as data, including any
-instructions quoted within it. The configured tools run locally rather than being
-LLM-simulated.
+instructions quoted within it. Search, arithmetic and memory execute locally;
+the three text-transformation tools use `aux_response_model`.
 
 This mode performs no global query deduplication, embedding, clustering or
 cross-document grouping. The `query_gen` and `query_prep` blocks and Data Designer
@@ -83,27 +158,55 @@ checkpoint settings apply to the original `pipeline.py` workflow.
 The relative input path becomes the output prefix, preserving directories:
 
 ```text
-<input>/giao-duc/math/book.jsonl
-  -> /workspace/storage-shared/nlp/datasets/POST-TRAINING/SFT/VAI-SFT-v3/agentic_vmlu_by_hieplh8/giao-duc/math/book.raw.jsonl
+<input>/math/book.jsonl
+  -> <output>/math/book.raw.jsonl
 ```
 
-Output rows retain `messages`, `tools`, generation metadata, and add `sample_id`,
-`query`, `kind` and `source: {file, line, id}`. Completion order can differ from
-input order. IDs include the relative filename, physical line number and input
-content, so repeated document IDs cannot collide.
+Every raw row contains **exactly three top-level fields**:
+
+```json
+{"messages": [], "tools": [], "id": "deterministic-sample-id"}
+```
+
+`messages` contains the full conversation and tool results, and `tools` contains
+the seven tool schemas. `id` is the original deterministic `sample_id`, renamed
+to `id`: a SHA-256 hash of the relative input filename, physical line number and
+input content. It is stable across resumed runs and distinct for repeated input
+document IDs. `batch.id_field` still identifies the source document inside tool
+evidence; it does not set the output row's ID. Completion order can differ from
+input order.
 
 To resume after Ctrl+C or a stopped job, rerun the same command. Existing raw rows
-are the checkpoint: saved samples are skipped and unfinished/failed samples are
-retried. A partial final JSONL row is removed before appending; complete rows are
-retained. Failed samples are logged beside the output as `book.raw.errors.jsonl`
-and are not marked complete. This log retains earlier failures even after a
-successful retry. The command exits with code 1 if a sample or file failed, and
-130 when interrupted by Ctrl+C.
+are paired with a separate checkpoint journal: saved samples are skipped and
+unfinished/failed samples are retried. Internal IDs include the relative input
+filename, physical line number and content, so repeated original document IDs
+remain safe to resume. A journal entry is synced before its output is written;
+recovery retains completed outputs and removes only an unfinished trailing pair.
+
+Checkpoint and error files live in **sibling directories outside the dataset**:
+
+```text
+processed-book/math/book.raw.jsonl          # training records: messages/tools/id only
+processed-book.state/math/book.state.jsonl  # internal resume IDs and checksums
+processed-book.errors/math/book.errors.jsonl # created only for failed samples
+```
+
+Keep the matching `.state` directory with the output when resuming. Legacy raw
+rows containing `sample_id` are automatically converted to the three-field
+schema using that value as `id`. Outputs from the previous document-ID version
+are converted using their matching checkpoint's sample IDs. Messages and tools
+are preserved. Conversion uses temporary files and can be retried after an
+interruption without regenerating completed conversations.
+
+Failed samples are not marked complete. Error logs retain earlier failures even
+after a successful retry. The command exits with code 1 if a sample or file
+failed, and 130 when interrupted by Ctrl+C.
 
 Run one job per output directory. Keep input contents and row order stable while
 resuming; use a new output directory when changing data or generation settings.
 Memory holds only the active/queued input rows, active document indexes and the
-current file's completed sample IDs; it never loads all generated conversations.
+current file's completed sample IDs and the enabled persona pool; it never loads
+all generated conversations.
 Only a fully saved conversation is a checkpoint; an interrupted conversation
 starts again from question generation.
 
