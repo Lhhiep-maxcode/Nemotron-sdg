@@ -17,6 +17,29 @@ def _terms(text: str) -> list[str]:
     return re.findall(r"[^\W_]+", unicodedata.normalize("NFC", text).casefold())
 
 
+def split_document(text: str, sample_id: str, doc_id: str, *,
+                   chunk_chars: int = 1800, overlap_chars: int = 200) -> list[Chunk]:
+    if not 0 <= overlap_chars < chunk_chars:
+        raise ValueError("Require 0 <= overlap_chars < chunk_chars")
+    chunks: list[Chunk] = []
+    start = 0
+    while start < len(text):
+        end = min(start + chunk_chars, len(text))
+        if end < len(text):
+            boundary = max(text.rfind("\n", start, end), text.rfind(" ", start, end))
+            if boundary > start + chunk_chars // 2:
+                end = boundary
+        passage = text[start:end].strip()
+        if passage:
+            chunk_id = "h" + hashlib.sha256(f"{sample_id}:{len(chunks)}".encode()).hexdigest()[:12]
+            chunks.append(Chunk(id=chunk_id, text=passage,
+                                     doc_id=doc_id))
+        if end == len(text):
+            break
+        start = max(start + 1, end - overlap_chars)
+    return chunks
+
+
 class LocalRetrievalClient:
     """Small BM25 index over ONE source document; no external service or embeddings.
 
@@ -27,25 +50,8 @@ class LocalRetrievalClient:
     def __init__(self, text: str, sample_id: str, doc_id: str, *,
                  chunk_chars: int = 1800, overlap_chars: int = 200,
                  oversample_factor: int = 2):
-        if not 0 <= overlap_chars < chunk_chars:
-            raise ValueError("Require 0 <= overlap_chars < chunk_chars")
         self.oversample_factor = max(1, oversample_factor)
-        self.chunks: list[Chunk] = []
-        start = 0
-        while start < len(text):
-            end = min(start + chunk_chars, len(text))
-            if end < len(text):
-                boundary = max(text.rfind("\n", start, end), text.rfind(" ", start, end))
-                if boundary > start + chunk_chars // 2:
-                    end = boundary
-            passage = text[start:end].strip()
-            if passage:
-                chunk_id = "h" + hashlib.sha256(f"{sample_id}:{len(self.chunks)}".encode()).hexdigest()[:12]
-                self.chunks.append(Chunk(id=chunk_id, text=passage,
-                                         doc_id=doc_id))
-            if end == len(text):
-                break
-            start = max(start + 1, end - overlap_chars)
+        self.chunks = split_document(text, sample_id, doc_id, chunk_chars=chunk_chars, overlap_chars=overlap_chars)
         self.counts = [Counter(_terms(c.text)) for c in self.chunks]
         self.lengths = [sum(c.values()) for c in self.counts]
         self.avg_length = sum(self.lengths) / max(1, len(self.lengths)) or 1

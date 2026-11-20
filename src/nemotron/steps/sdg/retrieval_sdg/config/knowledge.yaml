@@ -8,6 +8,7 @@ batch:
   output_dir: /workspace/storage-shared/nlp/datasets/POST-TRAINING/SFT/VAI-SFT-v3/agentic_vmlu_by_hieplh8/processed-book
   num_process: 128
   concurrency_per_process: 8
+  progress: true                   # count input rows, then show overall file/sample bars and ETA
   limit: null                        # optional smoke test: first N documents PER FILE
   text_field: text
   id_field: id
@@ -18,11 +19,11 @@ batch:
   kind_weights: {multi_hop: 1, comparative: 3, exploratory: 3, factual: 3, ambiguous: 1}
   seed: 42
 
-# Each document is an independent knowledge base: local search, no HTTP retriever
-# or embedding server needed. Only real source passages become tool evidence.
+# Sampled source passages are supplied directly in the assistant's context.
+# No search tool, retrieval service, or embedding server is used.
 retrieval:
   endpoint: ""
-  tools: [search]
+  tools: []
 
 persona:
   enabled: true
@@ -34,17 +35,8 @@ persona:
 tools:
   - type: function
     function:
-      name: search
-      description: Retrieve the most relevant passages (chunks) from the knowledge base for a query.
-      parameters:
-        type: object
-        properties:
-          query: {type: string, description: The search query.}
-        required: [query]
-  - type: function
-    function:
       name: calculator
-      description: Calculate with numbers obtained from retrieved evidence, such as ratios, percentages, recipe scaling and arithmetic. Supports parentheses and + - * / // % **. Use a decimal point, not a decimal comma. This tool supplies calculations, not factual evidence.
+      description: Calculate with numbers from the provided source passages, such as ratios, percentages, recipe scaling and arithmetic. Supports parentheses and + - * / // % **. Use a decimal point, not a decimal comma. This tool supplies calculations, not factual evidence.
       parameters:
         type: object
         properties:
@@ -73,7 +65,7 @@ tools:
   - type: function
     function:
       name: translation
-      description: Translate a short user query, retrieved phrase, or final answer while preserving source-backed meaning.
+      description: Translate a short user query, source phrase, or final answer while preserving source-backed meaning.
       parameters:
         type: object
         properties:
@@ -87,14 +79,14 @@ tools:
   - type: function
     function:
       name: citation_format
-      description: Format supplied retrieved identifiers in the requested citation style. Do not invent authors, titles, publication dates or source identifiers.
+      description: Format supplied source passage identifiers in the requested citation style. Do not invent authors, titles, publication dates or source identifiers.
       parameters:
         type: object
         properties:
           source_ids:
             type: array
             items: {type: string}
-            description: Retrieved chunk or document identifiers to cite.
+            description: Provided source passage or document identifiers to cite.
           style:
             type: string
             enum: [inline, footnote, apa, mla, chicago, simple]
@@ -103,7 +95,7 @@ tools:
   - type: function
     function:
       name: timeline_extract
-      description: Build a chronological timeline using only the supplied retrieved evidence snippets. Do not add events or dates absent from the snippets.
+      description: Build a chronological timeline using only the supplied source evidence snippets. Do not add events or dates absent from the snippets.
       parameters:
         type: object
         properties:
@@ -120,8 +112,9 @@ tools:
 engine:
   min_turns: 3
   max_turns: 20
-  max_tools: 7                       # offer all seven tools; the assistant selects which to call
-  force_first_tool: true
+  max_tools: 6                       # offer all six tools; use them when helpful
+  min_hops: 0
+  force_first_tool: false
   persona_voice: false
   gate_query: false
   inline_judge: false

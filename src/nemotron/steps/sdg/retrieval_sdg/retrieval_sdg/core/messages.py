@@ -19,6 +19,35 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, List
 
+SOURCE_PASSAGES_MARKER = "<SOURCE_PASSAGES>"
+
+
+def source_passages_from_messages(messages: list[dict]) -> list[dict]:
+    """Read structured source evidence supplied in a system message, if present."""
+    for message in messages:
+        if message.get("role") != "system":
+            continue
+        content = message.get("content", "") or ""
+        if SOURCE_PASSAGES_MARKER not in content:
+            continue
+        try:
+            passages, _ = json.JSONDecoder().raw_decode(content.split(SOURCE_PASSAGES_MARKER, 1)[1].lstrip())
+        except (ValueError, TypeError):
+            continue
+        if isinstance(passages, list):
+            return [p for p in passages if isinstance(p, dict) and isinstance(p.get("id"), str)
+                    and isinstance(p.get("text"), str) and p["text"].strip()]
+    return []
+
+
+def format_judge_history(messages: list[dict], **kwargs) -> str:
+    history = format_history_compact(messages, **kwargs)
+    sources = source_passages_from_messages(messages)
+    if sources:
+        return ("Source evidence provided to the assistant:\n"
+                + json.dumps(sources, ensure_ascii=False) + "\n\n" + history)
+    return history
+
 
 def format_tools_for_prompt(tools: List[Dict[str, Any]]) -> str:
     lines = []

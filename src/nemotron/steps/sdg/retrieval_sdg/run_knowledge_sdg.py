@@ -17,6 +17,8 @@ def main() -> None:
     parser.add_argument("--num-process", type=int, help="number of files processed simultaneously")
     parser.add_argument("--concurrency-per-process", type=int, help="concurrent samples inside each file worker")
     parser.add_argument("--limit", type=int, help="first N nonblank input rows per file, including resumed rows")
+    parser.add_argument("--no-progress", dest="progress", action="store_false", default=None,
+                        help="disable tqdm bars and skip the initial row-counting pass")
     args = parser.parse_args()
 
     from omegaconf import OmegaConf
@@ -25,7 +27,7 @@ def main() -> None:
     pipeline_path = config_path.parent / overrides.pop("pipeline_config", "pipeline.yaml")
     cfg = OmegaConf.to_container(OmegaConf.merge(OmegaConf.load(pipeline_path), overrides), resolve=True)
     batch = cfg["batch"]
-    for key in ("input_path", "output_dir", "num_process", "concurrency_per_process", "limit"):
+    for key in ("input_path", "output_dir", "num_process", "concurrency_per_process", "limit", "progress"):
         value = getattr(args, key)
         if value is not None:
             batch[key] = str(value) if isinstance(value, Path) else value

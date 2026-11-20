@@ -20,7 +20,7 @@ The expensive per-trajectory eval runs as ONE DD custom column, so DataDesigner
 gives it concurrency + per-row-group checkpointing (crash-safe, resumable). Scoring:
 
   1. OBJECTIVE (deterministic): every tool call parses + validates against its
-     schema; the trajectory made at least one retrieval call; it ends on a grounded
+     schema; the trajectory has retrieval or provided source evidence; it ends on a grounded
      (tool-free) answer; and no citation is fabricated.
   2. DEFECT GATE (optional, --judge): an LLM screens for binary train-harmful defects
      (unsupported claims / no real research / incoherent / request unresolved / user
@@ -46,6 +46,7 @@ from typing import Any, Dict, List, Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from retrieval_sdg.conversation.verifiers import ToolCallVerifier
+from retrieval_sdg.core.messages import source_passages_from_messages
 
 # binary train-harmful defects; a row is rejected if ANY fire (see prompts.TRAJECTORY_RUBRIC_PROMPT)
 DISQUALIFIERS = ["unsupported_claims", "no_real_research", "incoherent",
@@ -66,9 +67,10 @@ def _char_ngrams(text: str, n: int = 12) -> set:
 
 
 def _evidence_overlap(row: Dict[str, Any], n: int = 12) -> float:
-    """Grounding proxy: fraction of each answer's char n-grams also in the retrieved text."""
-    evidence = _char_ngrams(" ".join(m.get("content", "") for m in row.get("messages", [])
-                                     if m.get("role") == "tool"), n)
+    """Grounding proxy: fraction of each answer's char n-grams also in the source evidence."""
+    messages = row.get("messages", [])
+    evidence = _char_ngrams(" ".join([m.get("content", "") for m in messages if m.get("role") == "tool"]
+                                    + [p["text"] for p in source_passages_from_messages(messages)]), n)
     if not evidence:
         return 0.0
     scores = []
@@ -93,11 +95,12 @@ def _ids(msgs: List[Dict[str, Any]], role_pred, field: str = "content") -> set:
 
 
 def _citation_integrity(row: Dict[str, Any]) -> Dict[str, Any]:
-    """Every chunk id CITED must have been RETRIEVED in this conversation — checked on
+    """Every cited chunk id must have been retrieved or supplied as source evidence — checked on
     both the answer (assistant content) and, since it's a kept training target, the CoT
     (assistant reasoning_content)."""
     msgs = row.get("messages", [])
-    retrieved = _ids(msgs, lambda m: m.get("role") == "tool")
+    retrieved = _ids(msgs, lambda m: m.get("role") == "tool") | {
+        p["id"] for p in source_passages_from_messages(msgs)}
     cited = _ids(msgs, lambda m: m.get("role") == "assistant" and not m.get("tool_calls"))
     fabricated = sorted(cited - retrieved)
     r_cited = _ids(msgs, lambda m: m.get("role") == "assistant", field="reasoning_content")
@@ -129,9 +132,11 @@ def _objective(row: Dict[str, Any], verifier: ToolCallVerifier) -> Dict[str, Any
     last = msgs[-1] if msgs else {}
     ends_on_answer = last.get("role") == "assistant" and not last.get("tool_calls") and bool(last.get("content"))
     cite = _citation_integrity(row)
-    ok = (invalid == 0) and (n_calls > 0) and (retrievals > 0) and ends_on_answer and cite["citation_ok"]
+    sources = len(source_passages_from_messages(msgs))
+    ok = ((invalid == 0) and (n_calls > 0) and (retrievals > 0 or sources > 0)
+          and ends_on_answer and cite["citation_ok"])
     return {"tool_calls": n_calls, "invalid_calls": invalid, "retrievals": retrievals,
-            "ends_on_answer": ends_on_answer, **cite, "objective_ok": ok}
+            "source_passages": sources, "ends_on_answer": ends_on_answer, **cite, "objective_ok": ok}
 
 
 def _judge_from_config(config_path):
@@ -147,8 +152,10 @@ def _judge_from_config(config_path):
 
 def _make_judge(model: str, endpoint: str, api_key_env: str):
     from retrieval_sdg.core.caller import make_openai_caller
-    from retrieval_sdg.core.messages import format_history_compact, format_tools_for_prompt
-    from retrieval_sdg.conversation.prompts import JUDGE_SYSTEM_PROMPT, TRAJECTORY_RUBRIC_PROMPT
+    from retrieval_sdg.core.messages import format_judge_history, format_tools_for_prompt
+    from retrieval_sdg.conversation.prompts import (
+        JUDGE_SYSTEM_PROMPT, SOURCE_TRAJECTORY_RUBRIC_PROMPT, TRAJECTORY_RUBRIC_PROMPT,
+    )
     caller = make_openai_caller(model, endpoint, api_key_env,
                                 params={"temperature": 0.1, "max_tokens": 2000})
 
@@ -157,9 +164,11 @@ def _make_judge(model: str, endpoint: str, api_key_env: str):
         # tool outputs are snipped, recent turns kept, so the judge still sees the flow.
         # wide tool snippets so the judge SEES the retrieved evidence (a tight snippet
         # truncates the chunk text/ids and makes faithful answers look unsupported).
-        prompt = TRAJECTORY_RUBRIC_PROMPT.format(
+        template = SOURCE_TRAJECTORY_RUBRIC_PROMPT if source_passages_from_messages(row.get("messages", [])) \
+            else TRAJECTORY_RUBRIC_PROMPT
+        prompt = template.format(
             tools=format_tools_for_prompt(row.get("tools", [])),
-            conversation=format_history_compact(row.get("messages", []), max_chars=180000, tool_snippet=4000))
+            conversation=format_judge_history(row.get("messages", []), max_chars=180000, tool_snippet=4000))
         text = caller(JUDGE_SYSTEM_PROMPT, prompt)
         a, b = text.find("{"), text.rfind("}")
         if a < 0 or b <= a:

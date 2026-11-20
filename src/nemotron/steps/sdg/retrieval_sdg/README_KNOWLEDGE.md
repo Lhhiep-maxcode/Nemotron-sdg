@@ -12,7 +12,7 @@ Run from `src/nemotron/steps/sdg/retrieval_sdg/` with Python 3.10+.
 The standalone runner needs:
 
 ```bash
-python -m pip install openai 'pydantic>=2' omegaconf
+python -m pip install openai 'pydantic>=2' omegaconf tqdm
 ```
 
 Your supplied config enables a local Parquet persona dataset, which also needs:
@@ -78,6 +78,29 @@ are preserved in the checked-in config. Choose concurrency to fit your model
 server capacity and available memory. Enabled personas are loaded and cached once
 per worker process, so their memory usage also scales with the process count.
 
+## Progress and ETA
+
+`tqdm` shows two overall bars in the parent process, regardless of the worker
+count: `Samples` and `Files`. The sample bar includes saved, resumed and failed
+counts, the rate of newly attempted samples, elapsed time and estimated time
+remaining. Updates for saved samples happen only after durable output writes.
+Resume skips advance the bar without inflating the generation rate. ETA appears
+after the first new attempt finishes and remains approximate as conversation
+lengths and server throughput vary.
+
+By default the runner first counts selected nonblank input rows, respecting
+`--limit` per file. This adds one streaming input scan for accurate totals without
+loading the dataset into memory. Disable both the bars and this counting pass
+with `batch.progress: false` in the config or:
+
+```bash
+python run_knowledge_sdg.py --no-progress
+```
+
+The sample bar counts saved rows, resume skips and failed attempts. A failed
+attempt is not saved and will be retried on the next run. File errors can leave
+the sample bar incomplete; see the final summary and error logs.
+
 ## Turn limits and model roles
 
 The knowledge config explicitly overrides these values:
@@ -86,8 +109,9 @@ The knowledge config explicitly overrides these values:
 engine:
   min_turns: 3
   max_turns: 20
-  max_tools: 7
-  force_first_tool: true
+  max_tools: 6
+  min_hops: 0
+  force_first_tool: false
   persona_voice: false
   gate_query: false
   inline_judge: false
@@ -96,14 +120,15 @@ engine:
 The planner samples a count between 3 and 20, favoring the middle of the range.
 A turn is a main user request plus the assistant's research and answer; tool calls
 are internal steps. Conversations can finish early when no follow-up or answer is
-produced, and clarification exchanges can add messages. `max_tools: 7` offers all
-seven tools; it does not require every conversation to call all seven.
+produced, and clarification exchanges can add messages. `max_tools: 6` offers all
+six remaining tools; the assistant calls them when useful. Search is not offered,
+and tool calls are not forced to meet a minimum search count.
 The inherited `max_tool_calls_per_turn: 3` limits each assistant tool-call batch;
 one research turn can contain multiple batches.
 
 | Model alias | Role |
 |---|---|
-| `assistant_model` | Chooses tools, researches, and writes the assistant's answers. |
+| `assistant_model` | Answers from the provided source passages and selects auxiliary tools when helpful. |
 | `user_model` | Generates the opening question, follow-ups, and clarification replies. |
 | `aux_response_model` | Produces JSON responses for translation, citation formatting, and timeline extraction. |
 | `judge_model` | Checks queries/trajectories when generation gates are enabled, or scores output through `evaluate.py --judge`. |
@@ -120,7 +145,8 @@ to false to skip persona loading.
 
 Your `chunk_chars: 32768`, `query_chunks: 3`, `max_chars_per_chunk: 32768`, and
 assistant `max_tokens: 65536` allow large requests. The query prompt alone can
-contain up to 98,304 source characters, and a search can return four full chunks.
+contain up to 98,304 source characters. The same bounded source passages are
+provided directly to the assistant in its system context and saved in `messages`.
 Ensure your served context window fits the prompt plus requested completion;
 compression uses estimates and retains recent tool results, so its threshold is
 not a strict model context limit. Model availability, context capacity, endpoint
@@ -128,26 +154,29 @@ access, and the cluster persona path require checking on your deployment.
 
 ## Tools and document scope
 
-- `search`: real BM25 passage search within the current source document, with
-  stable citation IDs. Supports Vietnamese text and retrieves actual source
-  passages for questions about mathematics, literature, recipes, books and
-  education. It needs no retrieval or embedding service.
 - `calculator`: real, bounded arithmetic for ratios, percentages, recipe scaling
-  and numerical exercises, using values from retrieved evidence.
+  and numerical exercises, using values from the provided source passages.
 - `memory_read` / `memory_write`: real state shared across turns within one
   generated conversation. It is isolated from other conversations and is not
   persisted across independent samples or sessions.
 - `translation`: LLM-backed translation of the supplied text, with optional
   preservation of domain terms.
-- `citation_format`: LLM-backed formatting of supplied retrieved identifiers;
+- `citation_format`: LLM-backed formatting of supplied source identifiers;
   bibliographic details that were not provided must not be invented.
 - `timeline_extract`: LLM-backed chronology from the supplied evidence snippets.
 
-Each document is a separate knowledge base. Multi-hop questions combine passages
-from that document. Questions follow the source language; follow-ups and answers
-follow the conversation language. Source text is treated as data, including any
-instructions quoted within it. Search, arithmetic and memory execute locally;
-the three text-transformation tools use `aux_response_model`.
+Each document supplies the passages used for its opening question. Those same
+passages, with stable citation IDs, are supplied directly to the assistant. It
+has no search tool and cannot look up additional passages; follow-ups stay within
+the available evidence. Questions follow the source language; follow-ups and
+answers follow the conversation language. Source text is treated as data,
+including any instructions quoted within it. Arithmetic and memory execute
+locally; the three text-transformation tools use `aux_response_model`.
+
+No search index, HTTP retrieval call or embedding service is used in this mode.
+The inherited `retrieval.top_k` and `oversample_factor` do not apply without a
+retrieval tool. The original `pipeline.py` retrieval workflow remains available;
+the knowledge config overrides its tools and routing.
 
 This mode performs no global query deduplication, embedding, clustering or
 cross-document grouping. The `query_gen` and `query_prep` blocks and Data Designer
@@ -169,7 +198,7 @@ Every raw row contains **exactly three top-level fields**:
 ```
 
 `messages` contains the full conversation and tool results, and `tools` contains
-the seven tool schemas. `id` is the original deterministic `sample_id`, renamed
+the six tool schemas. `id` is the original deterministic `sample_id`, renamed
 to `id`: a SHA-256 hash of the relative input filename, physical line number and
 input content. It is stable across resumed runs and distinct for repeated input
 document IDs. `batch.id_field` still identifies the source document inside tool
@@ -182,6 +211,11 @@ unfinished/failed samples are retried. Internal IDs include the relative input
 filename, physical line number and content, so repeated original document IDs
 remain safe to resume. A journal entry is synced before its output is written;
 recovery retains completed outputs and removes only an unfinished trailing pair.
+
+Press **Ctrl+C** to stop the current command, wait for it to exit, then run
+`python run_knowledge_sdg.py` again with the same config and paths. No `--resume`
+flag is needed. Progress is reconstructed from the checkpoints; in-flight
+conversations start again from question generation.
 
 Checkpoint and error files live in **sibling directories outside the dataset**:
 
@@ -204,6 +238,9 @@ failed, and 130 when interrupted by Ctrl+C.
 
 Run one job per output directory. Keep input contents and row order stable while
 resuming; use a new output directory when changing data or generation settings.
+In particular, samples saved before removing search retain their original tool
+schemas and calls. Use a new output directory to regenerate a wholly search-free
+dataset; resuming skips those existing samples.
 Memory holds only the active/queued input rows, active document indexes and the
 current file's completed sample IDs and the enabled persona pool; it never loads
 all generated conversations.
@@ -211,7 +248,11 @@ Only a fully saved conversation is a checkpoint; an interrupted conversation
 starts again from question generation.
 
 These are raw trajectories. Quality filtering remains a separate operation using
-the existing evaluator and its Data Designer dependencies; pass an explicit file:
+the existing evaluator and its Data Designer dependencies; pass an explicit file.
+The evaluator accepts the provided source passages as grounding evidence and
+checks citations against their IDs. It still requires at least one valid tool
+call for an agentic SFT example, so raw conversations that needed no tools are
+filtered out:
 
 ```bash
 python evaluate.py --config config/pipeline.yaml \

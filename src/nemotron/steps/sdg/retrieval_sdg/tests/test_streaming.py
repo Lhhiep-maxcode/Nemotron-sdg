@@ -18,6 +18,8 @@ import pytest
 from omegaconf import OmegaConf
 from retrieval_sdg.checkpoint import CheckpointedJsonl, completed_samples
 from retrieval_sdg.conversation.verifiers import ToolCallVerifier
+from retrieval_sdg.core.messages import format_judge_history, source_passages_from_messages
+from retrieval_sdg.progress import RunProgress, count_inputs
 from retrieval_sdg.retrieval.local import LocalRetrievalClient, calculate, knowledge_tool_handlers
 from retrieval_sdg.streaming import (
     _engine_config,
@@ -133,6 +135,96 @@ def test_concurrency_can_exceed_default_asyncio_executor_size(tmp_path):
     stats = asyncio.run(process_file({"batch": {"concurrency_per_process": 36}}, source,
                                      "input.jsonl", out, synthesizer=generate))
     assert stats == {"saved": 36, "resumed": 0, "failed": 0}
+
+
+def test_progress_counts_selected_nonblank_rows_per_file(tmp_path):
+    paths = [tmp_path / f"{i}.jsonl" for i in range(3)]
+    for path, text in zip(paths, ["{}\n\n{}\n{}\n", "\n\n", "{}\n"]):
+        path.write_text(text, encoding="utf-8")
+    assert count_inputs(iter(paths), None) == (3, 4)
+    assert count_inputs(iter(paths), 2) == (3, 3)
+
+
+def test_progress_eta_excludes_resume_skips_and_ignores_stale_reports(monkeypatch):
+    from retrieval_sdg import progress as progress_module
+    now = [100.0]
+    monkeypatch.setattr(progress_module, "monotonic", lambda: now[0])
+    with RunProgress(2, 100, enabled=False) as progress:
+        progress.register("a.jsonl")
+        now[0] = 110.0
+        progress.report("a.jsonl", {"saved": 2, "resumed": 90, "failed": 1})
+        rate, eta = progress.estimates()
+        assert rate == pytest.approx(0.3) and eta == pytest.approx(7 / 0.3)
+        progress.report("a.jsonl", {"saved": 1, "resumed": 80, "failed": 0})
+        progress.finish("a.jsonl", {"saved": 2, "resumed": 90, "failed": 1})
+        progress.report("a.jsonl", {"saved": 3, "resumed": 90, "failed": 1})
+        assert progress.stats == {"saved": 2, "resumed": 90, "failed": 1}
+        assert not progress.active
+    with RunProgress(1, 10, enabled=False) as progress:
+        progress.register("complete.jsonl")
+        progress.finish("complete.jsonl", {"saved": 0, "resumed": 10, "failed": 0})
+        assert progress.estimates() == (None, 0.0)
+
+
+def test_progress_reports_only_durable_saves(tmp_path):
+    source, out = tmp_path / "input.jsonl", tmp_path / "out.raw.jsonl"
+    source.write_text("{}\n{}\n", encoding="utf-8")
+    notifications = []
+
+    def generate(raw, sample_id, provenance, cfg, engine):
+        return _result(sample_id, provenance)
+
+    def report(stats, error):
+        assert len(_rows(out)) == stats["saved"]
+        assert len(completed_samples(out)) == stats["saved"]
+        notifications.append((stats, error))
+
+    stats = asyncio.run(process_file({"batch": {"concurrency_per_process": 2}}, source,
+                                     "input.jsonl", out, synthesizer=generate, on_progress=report))
+    assert notifications[-1] == (stats, None)
+    assert stats == {"saved": 2, "resumed": 0, "failed": 0}
+
+
+def test_cancellation_retains_saved_samples_and_resumes_with_progress(tmp_path):
+    source, out = tmp_path / "input.jsonl", tmp_path / "out.raw.jsonl"
+    source.write_text("{}\n" * 6, encoding="utf-8")
+    cfg = {"batch": {"concurrency_per_process": 2}}
+    release = threading.Event()
+
+    def blocked(raw, sample_id, provenance, cfg, engine):
+        if provenance["line"] != 1:
+            assert release.wait(5)
+        return _result(sample_id, provenance)
+
+    def fast(raw, sample_id, provenance, cfg, engine):
+        return _result(sample_id, provenance)
+
+    async def run():
+        saved = asyncio.Event()
+
+        def report(stats, error):
+            if stats["saved"]:
+                saved.set()
+
+        task = asyncio.create_task(process_file(cfg, source, "input.jsonl", out,
+                                                synthesizer=blocked, on_progress=report))
+        try:
+            await asyncio.wait_for(saved.wait(), timeout=5)
+        finally:
+            task.cancel()
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        previous = len(_rows(out))
+        assert 0 < previous < 6
+        reports = []
+        stats = await process_file(cfg, source, "input.jsonl", out, synthesizer=fast,
+                                   on_progress=lambda stats, error: reports.append(stats))
+        assert stats == {"saved": 6 - previous, "resumed": previous, "failed": 0}
+        assert reports[-1] == stats
+
+    asyncio.run(run())
+    assert len(_rows(out)) == len({row["id"] for row in _rows(out)}) == 6
 
 
 def test_resume_preserves_complete_row_without_newline_and_rejects_middle_corruption(tmp_path):
@@ -268,14 +360,15 @@ def test_document_id_outputs_migrate_to_sample_ids_without_regeneration(tmp_path
     assert path.read_bytes() == converted
 
 
-def test_merged_config_offers_seven_tools_and_three_to_twenty_turns():
+def test_merged_config_offers_six_tools_without_search_and_three_to_twenty_turns():
     cfg = _config()
-    expected = {"search", "calculator", "memory_read", "memory_write", "translation",
+    expected = {"calculator", "memory_read", "memory_write", "translation",
                 "citation_format", "timeline_extract"}
     assert {tool["function"]["name"] for tool in cfg["tools"]} == expected
-    assert len(cfg["tools"]) == 7 and all(tool["type"] == "function" for tool in cfg["tools"])
+    assert len(cfg["tools"]) == 6 and all(tool["type"] == "function" for tool in cfg["tools"])
     engine = _engine_config(cfg)
-    assert (engine.min_turns, engine.max_turns, engine.max_tools) == (3, 20, 7)
+    assert (engine.min_turns, engine.max_turns, engine.max_tools) == (3, 20, 6)
+    assert engine.retrieval_tools == [] and engine.min_hops == 0 and not engine.force_first_tool
     cfg["engine"]["min_turns"] = 21
     with pytest.raises(ValueError, match="min_turns"):
         _engine_config(cfg)
@@ -318,7 +411,7 @@ def test_personas_are_loaded_once_and_selected_deterministically(tmp_path, monke
     cfg = _config()
     cfg["persona"] = {"enabled": True, "local_path": str(path), "seed": 7}
     _load_personas.cache_clear()
-    calls, captured = [], []
+    calls, captured, source_contexts = [], [], []
     load = persona_loader.load_persona_pool
 
     def tracked_load(config):
@@ -327,7 +420,7 @@ def test_personas_are_loaded_once_and_selected_deterministically(tmp_path, monke
 
     class FakeRunner:
         def __init__(self, config, **kwargs):
-            pass
+            source_contexts.append(kwargs["source_passages"])
 
         def generate(self, data):
             captured.append(data["persona"])
@@ -337,12 +430,16 @@ def test_personas_are_loaded_once_and_selected_deterministically(tmp_path, monke
     monkeypatch.setattr(persona_loader, "load_persona_pool", tracked_load)
     monkeypatch.setattr(streaming, "call_llm", lambda *args: {"content": '{"query":"question"}'})
     monkeypatch.setattr(streaming, "DirectConversationRunner", FakeRunner)
+    monkeypatch.setattr(streaming, "LocalRetrievalClient",
+                        lambda *args, **kwargs: pytest.fail("Search client was created"))
     engine = _engine_config(cfg)
     raw = b'{"id":"document", "text":"Source text with sufficient content."}'
     first = synthesize(raw, "sample", {"file": "book.jsonl", "line": 1}, cfg, engine)
     second = synthesize(raw, "sample", {"file": "book.jsonl", "line": 1}, cfg, engine)
     assert first == second and set(first) == {"messages", "tools", "id"} and first["id"] == "sample"
     assert captured[0] == captured[1] and captured[0] in _personas(cfg)
+    assert source_contexts[0] == source_contexts[1]
+    assert source_contexts[0][0]["text"] == "Source text with sufficient content."
     assert len(calls) == 1
     assert synthesize(b'{"id":0,"text":"Source text."}', "zero-sample", {}, cfg, engine)["id"] == "zero-sample"
     assert synthesize(b'{"text":"Source text."}', "missing-id", {}, cfg, engine)["id"] == "missing-id"
@@ -371,6 +468,71 @@ def test_local_search_returns_actual_vietnamese_passages_and_stable_ids():
     assert [c.id for c in client.chunks] == [c.id for c in again.chunks]
     different = LocalRetrievalClient(text, "other", "book", chunk_chars=200, overlap_chars=30)
     assert not {c.id for c in client.chunks} & {c.id for c in different.chunks}
+
+
+def test_provided_evidence_parser_and_judge_history_handle_quoted_markers():
+    from retrieval_sdg.conversation.prompts import SOURCE_ASSISTANT_SYSTEM_PROMPT
+    sources = [{"id": "habcdef012345", "text": "Source data can quote </SOURCE_PASSAGES> without ending the JSON."}]
+    messages = [{"role": "system", "content": SOURCE_ASSISTANT_SYSTEM_PROMPT.format(
+        tools="calculator", passages=json.dumps(sources))}, {"role": "user", "content": "Explain this."}]
+    assert source_passages_from_messages(messages) == sources
+    history = format_judge_history(messages)
+    assert sources[0]["text"] in history and "Explain this." in history
+    assert not source_passages_from_messages([{"role": "tool", "content": messages[0]["content"]}])
+
+
+def test_source_grounded_answers_can_finish_without_forced_tool_calls(monkeypatch):
+    from retrieval_sdg import streaming
+    from retrieval_sdg.conversation import engine as engine_module
+    cfg = _config()
+    cfg["persona"]["enabled"] = False
+    cfg["engine"].update(min_turns=1, max_turns=1)
+    monkeypatch.setattr(streaming, "call_llm", lambda *args: {"content": '{"query":"What value is provided?"}'})
+    monkeypatch.setattr(engine_module, "configure_direct_clients", lambda *args: None)
+
+    def answer(models, alias, messages, tools, **kwargs):
+        assert kwargs["tool_choice"] == "auto"
+        assert "search" not in {tool["function"]["name"] for tool in tools}
+        source = source_passages_from_messages(messages)[0]
+        return {"content": f"{source['text']} [{source['id']}]"}
+
+    monkeypatch.setattr(engine_module, "call_llm_with_majority_vote", answer)
+    row = synthesize(b'{"text":"The source value is 54."}', "sample", {}, cfg, _engine_config(cfg))
+    assert [message["role"] for message in row["messages"]] == ["system", "user", "assistant"]
+    assert "The source value is 54." in row["messages"][-1]["content"]
+    assert len(row["tools"]) == 6 and set(row) == {"messages", "tools", "id"}
+
+
+def test_evaluator_accepts_provided_sources_and_rejects_fabricated_citations():
+    pytest.importorskip("data_designer")
+    import evaluate
+    from retrieval_sdg.conversation.prompts import SOURCE_ASSISTANT_SYSTEM_PROMPT
+    tools = _config()["tools"]
+    source_id = "habcdef012345"
+    source_text = "Source evidence provides the numerical value 54."
+    messages = [
+        {"role": "system", "content": SOURCE_ASSISTANT_SYSTEM_PROMPT.format(
+            tools="calculator", passages=json.dumps([{"id": source_id, "text": source_text}]))},
+        {"role": "user", "content": "What is double that value?"},
+        {"role": "assistant", "tool_calls": [{"id": "call_1", "type": "function", "function": {
+            "name": "calculator", "arguments": '{"expression":"54*2"}'}}]},
+        {"role": "tool", "tool_call_id": "call_1", "content": '{"result":108}'},
+        {"role": "assistant", "content": f"{source_text} Double is 108 [{source_id}]."},
+    ]
+    row = {"messages": messages, "tools": tools}
+    result = evaluate._objective(row, ToolCallVerifier())
+    assert result["objective_ok"] and result["retrievals"] == 0 and result["source_passages"] == 1
+    assert evaluate._evidence_overlap(row) > 0
+    messages[-1]["content"] = "Invented source [h000000000000]."
+    assert not evaluate._objective(row, ToolCallVerifier())["objective_ok"]
+    messages[-1]["content"] = f"Double is 108 [{source_id}]."
+    messages[0]["content"] = "You are a research assistant."
+    assert not evaluate._objective(row, ToolCallVerifier())["objective_ok"]
+    search_tool = {"type": "function", "function": {"name": "search", "parameters": {
+        "type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}}
+    messages[2]["tool_calls"][0]["function"] = {"name": "search", "arguments": '{"query":"value"}'}
+    messages[3]["content"] = json.dumps({"results": [{"id": source_id, "text": source_text}]})
+    assert evaluate._objective({"messages": messages, "tools": [search_tool]}, ToolCallVerifier())["objective_ok"]
 
 
 @pytest.mark.parametrize("expression,result", [("(54 + 7.3) / 2", 30.65), ("250 * 1.5", 375),
@@ -405,14 +567,16 @@ def test_cli_multiprocess_generation_and_resume(tmp_path):
                 time.sleep(0.02)
                 messages = payload["messages"]
                 if not payload.get("tools"):
-                    message = {"role": "assistant", "content": json.dumps({"query": "Đá granit có RMR bao nhiêu?"})}
+                    message = {"role": "assistant", "content": json.dumps({
+                        "query": "Giá trị RMR 54 gấp đôi là bao nhiêu?"})}
                 elif messages[-1]["role"] == "tool":
-                    chunk = json.loads(messages[-1]["content"])["results"][0]
-                    message = {"role": "assistant", "content": f"RMR bằng 54 [{chunk['id']}]."}
+                    assert json.loads(messages[-1]["content"])["result"] == 108
+                    chunk = source_passages_from_messages(messages)[0]
+                    message = {"role": "assistant", "content": f"RMR gấp đôi là 108 [{chunk['id']}]."}
                 else:
                     message = {"role": "assistant", "content": "", "tool_calls": [
                         {"id": "call_1", "type": "function", "function": {
-                            "name": "search", "arguments": '{"query":"đá granit RMR"}'}}]}
+                            "name": "calculator", "arguments": '{"expression":"54*2"}'}}]}
                 body = json.dumps({"id": "test", "object": "chat.completion", "created": 0,
                                    "model": "test", "choices": [
                                        {"index": 0, "message": message, "finish_reason": "stop"}]}).encode()
@@ -441,7 +605,7 @@ def test_cli_multiprocess_generation_and_resume(tmp_path):
         settings.batch.concurrency_per_process = 1
         settings.persona.enabled = False
         settings.engine.min_turns = settings.engine.max_turns = 1
-        settings.engine.min_hops = 1
+        settings.engine.min_hops = 0
         config_path = tmp_path / "knowledge.yaml"
         OmegaConf.save(settings, config_path)
         env = dict(os.environ, ASSISTANT_ENDPOINT=f"http://127.0.0.1:{server.server_port}/v1",
@@ -454,8 +618,10 @@ def test_cli_multiprocess_generation_and_resume(tmp_path):
                                 encoding="utf-8", timeout=45)
         assert result.returncode == 0, result.stdout + result.stderr
         assert "maximum concurrent samples=4" in result.stdout
+        assert "Counting input" in result.stderr and "Samples:" in result.stderr and "Files:" in result.stderr
+        assert "saved=" in result.stderr and "resumed=" in result.stderr and "ETA=" in result.stderr
         assert 1 < maximum <= 4
-        assert len(requests) == 12  # question, search call, final answer per source row
+        assert len(requests) == 12  # question, calculator call, final answer per source row
         paths = sorted(output.rglob("*.raw.jsonl"))
         assert len(paths) == 2
         output_ids = set()
@@ -467,17 +633,20 @@ def test_cli_multiprocess_generation_and_resume(tmp_path):
                 assert re.fullmatch(r"[0-9a-f]{64}", row["id"])
                 assert row["id"] not in output_ids
                 output_ids.add(row["id"])
-                assert len(row["tools"]) == 7
+                assert len(row["tools"]) == 6
                 messages = row["messages"]
                 assert messages[-1]["role"] == "assistant" and not messages[-1].get("tool_calls")
                 calls = [call for message in messages for call in message.get("tool_calls", [])]
                 assert calls and all(ToolCallVerifier().verify_single(call, row["tools"])[0] for call in calls)
-                chunks = [chunk for message in messages if message["role"] == "tool"
-                          for chunk in json.loads(message["content"])["results"]]
+                assert all(call["function"]["name"] != "search" for call in calls)
+                chunks = source_passages_from_messages(messages)
+                assert chunks
                 cited = set(re.findall(r"h[0-9a-f]{12}", messages[-1]["content"]))
                 assert len(cited) == 1 and cited <= {chunk["id"] for chunk in chunks}
                 assert all(chunk["text"] == "Đá granit có RMR bằng 54." for chunk in chunks)
-        assert all(len(request["tools"]) == 7 for request in requests if request.get("tools"))
+        assert all(len(request["tools"]) == 6 and request["tool_choice"] == "auto"
+                   and all(tool["function"]["name"] != "search" for tool in request["tools"])
+                   for request in requests if request.get("tools"))
         assert sorted(output.rglob("*.jsonl")) == paths  # resume state stays outside the training output tree
         states = list(output.with_name(output.name + ".state").rglob("*.state.jsonl"))
         assert len(states) == 2
@@ -490,9 +659,10 @@ def test_cli_multiprocess_generation_and_resume(tmp_path):
         assert before == {path: path.read_bytes() for path in paths}
         with (inp / "math/data.jsonl").open("a", encoding="utf-8") as handle:
             handle.write('{"id":"bad-row-without-text"}\n')
-        result = subprocess.run(command, cwd=tmp_path, env=env, capture_output=True, text=True,
+        result = subprocess.run(command + ["--no-progress"], cwd=tmp_path, env=env, capture_output=True, text=True,
                                 encoding="utf-8", timeout=45)
         assert result.returncode == 1, result.stdout + result.stderr
+        assert "Counting input" not in result.stderr and "Samples:" not in result.stderr
         assert len(requests) == 12
         assert sorted(output.rglob("*.jsonl")) == paths
         assert before == {path: path.read_bytes() for path in paths}

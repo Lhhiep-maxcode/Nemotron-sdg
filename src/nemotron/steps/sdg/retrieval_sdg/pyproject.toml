@@ -13,6 +13,7 @@ dependencies = [
     "openai",                  # direct tool-calling clients + offline callers
     "pyyaml",
     "omegaconf",               # configuration loading (pipeline and streaming runner)
+    "tqdm",                   # aggregate file/sample progress and ETA
 ]
 
 [project.optional-dependencies]

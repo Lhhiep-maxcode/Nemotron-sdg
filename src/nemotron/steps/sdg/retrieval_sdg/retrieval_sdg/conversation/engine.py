@@ -32,16 +32,25 @@ import random
 from typing import Any, Dict, List, Optional
 
 from ..core.llm import call_llm, call_llm_with_majority_vote, configure_direct_clients
-from ..core.messages import format_history_compact, format_tools_for_prompt
+from ..core.messages import format_history_compact, format_judge_history, format_tools_for_prompt
 from ..core.persona import format_persona_for_prompt
 from ..retrieval.client import HttpRetrievalClient
 from .config import ConversationSimulatorConfig
-from .context import ResearchMemory, build_assistant_view, _estimate_tokens
+from .context import ResearchMemory, _estimate_tokens, build_assistant_view
 from .judges import run_inline_judge
 from .planner import plan_conversation
 from .prompts import (
-    ASSISTANT_SYSTEM_PROMPT, KIND_DIRECTIVES, QUERY_GATE_JUDGE_PROMPT, TRAJECTORY_JUDGE_PROMPT,
-    USER_AGENT_SYSTEM_PROMPT, USER_CLARIFY_DIRECTIVE, USER_FOLLOWUP_DIRECTIVE, USER_OPENING_DIRECTIVE,
+    ASSISTANT_SYSTEM_PROMPT,
+    KIND_DIRECTIVES,
+    QUERY_GATE_JUDGE_PROMPT,
+    SOURCE_ASSISTANT_SYSTEM_PROMPT,
+    SOURCE_TRAJECTORY_JUDGE_PROMPT,
+    SOURCE_USER_SYSTEM_PROMPT,
+    TRAJECTORY_JUDGE_PROMPT,
+    USER_AGENT_SYSTEM_PROMPT,
+    USER_CLARIFY_DIRECTIVE,
+    USER_FOLLOWUP_DIRECTIVE,
+    USER_OPENING_DIRECTIVE,
 )
 from .tools import ToolEnvironment, sample_tools
 from .verifiers import ToolCallVerifier
@@ -55,6 +64,7 @@ class ConversationEngine:
     # ── async entry point: DD runs the client in async mode ──────────────────
     async def agenerate(self, data: dict) -> dict:
         import asyncio
+
         from ..core.llm import DD_EVENT_LOOP
         DD_EVENT_LOOP.set(asyncio.get_running_loop())
         return await asyncio.to_thread(self.generate, dict(data))
@@ -98,11 +108,16 @@ class ConversationEngine:
             if verdict["parsed"] and not verdict["success"]:
                 return self._skipped(data, cfg, "query_gate_failed", verdict["explanation"])
 
+        sources = getattr(self, "source_passages", None)
+        system = (SOURCE_ASSISTANT_SYSTEM_PROMPT.format(tools=tools_str,
+                                                       passages=json.dumps(sources, ensure_ascii=False))
+                  if sources else ASSISTANT_SYSTEM_PROMPT.format(tools=tools_str))
         messages: List[Dict[str, Any]] = [
-            {"role": "system", "content": ASSISTANT_SYSTEM_PROMPT.format(tools=format_tools_for_prompt(tools))},
+            {"role": "system", "content": system},
             {"role": "user", "content": opening},
         ]
-        memory = ResearchMemory(plan="Answer the user by researching with the tools; ground every claim.")
+        memory = ResearchMemory(plan="Answer from the provided source passages; use tools when helpful."
+                                if sources else "Answer the user by researching with the tools; ground every claim.")
 
         total_hops = 0
         n_turns = min(plan.n_turns, cfg.max_turns)
@@ -224,9 +239,9 @@ class ConversationEngine:
 
     # ── user-simulator helpers (one rich system prompt + a per-turn directive) ─
     def _user_system(self, persona_str, tools_str) -> Dict[str, Any]:
+        prompt = SOURCE_USER_SYSTEM_PROMPT if getattr(self, "source_passages", None) else USER_AGENT_SYSTEM_PROMPT
         return {"role": "system",
-                "content": USER_AGENT_SYSTEM_PROMPT.format(persona=persona_str or "(a curious, everyday person)",
-                                                           tools=tools_str)}
+                "content": prompt.format(persona=persona_str or "(a curious, everyday person)", tools=tools_str)}
 
     def _voice_query(self, models, persona_str, tools_str, query) -> str:
         r = call_llm(models, MODEL_USER, [self._user_system(persona_str, tools_str),
@@ -267,9 +282,11 @@ class ConversationEngine:
         ends_on_answer = last.get("role") == "assistant" and not last.get("tool_calls") and bool(last.get("content"))
         status, judgment = ends_on_answer, {}
         if cfg.inline_judge and ends_on_answer:
-            verdict = run_inline_judge(models, MODEL_JUDGE, TRAJECTORY_JUDGE_PROMPT.format(
+            prompt = (SOURCE_TRAJECTORY_JUDGE_PROMPT if getattr(self, "source_passages", None)
+                      else TRAJECTORY_JUDGE_PROMPT)
+            verdict = run_inline_judge(models, MODEL_JUDGE, prompt.format(
                 tools=tools_str,
-                conversation=format_history_compact(messages, max_chars=16000, tool_snippet=400)))
+                conversation=format_judge_history(messages, max_chars=16000, tool_snippet=400)))
             judgment = {"explanation": verdict["explanation"], "rating": verdict["rating"]}
             status = verdict["success"]
 
@@ -305,10 +322,11 @@ class ConversationEngine:
 class DirectConversationRunner(ConversationEngine):
     """Run the same engine with direct model clients and an optional local corpus."""
 
-    def __init__(self, config: ConversationSimulatorConfig, *, client=None, tool_handlers=None):
+    def __init__(self, config: ConversationSimulatorConfig, *, client=None, tool_handlers=None, source_passages=None):
         self.config = config
         self.client = client
         self.tool_handlers = tool_handlers
+        self.source_passages = source_passages
 
     def get_model(self, alias):
         return None  # core.llm uses the configured direct OpenAI clients
